@@ -38,10 +38,21 @@ use strict;
 use warnings;
 use re 'taint';
 
+require 5.008001;  # needs utf8::is_utf8()
+
 use Mail::SpamAssassin;
 use Mail::SpamAssassin::Constants qw(:sa);
 use Mail::SpamAssassin::HTML;
 use Mail::SpamAssassin::Logger;
+
+our($enc_utf8, $enc_w1252, $have_encode_detector);
+BEGIN {
+  eval { require Encode }
+    and do { $enc_utf8  = Encode::find_encoding('UTF-8');
+             $enc_w1252 = Encode::find_encoding('Windows-1252') };
+  eval { require Encode::Detect::Detector }
+    and do { $have_encode_detector = 1 };
+};
 
 =item new()
 
@@ -175,7 +186,7 @@ sub header {
     $dec_value =~ s/\n[ \t]+/ /gs;
     $dec_value =~ s/\s+$//s;
     $dec_value =~ s/^\s+//s;
-    push @{ $self->{'headers'}->{$key} }, $self->_decode_header($dec_value,$key);
+    push @{ $self->{'headers'}->{$key} }, _decode_header($dec_value,$key);
 
     push @{ $self->{'raw_headers'}->{$key} }, $raw_value;
 
@@ -272,8 +283,9 @@ sub raw {
     my $fd = $self->{'raw'};
     seek($fd, 0, 0)  or die "message: cannot rewind file: $!";
 
-    my($inbuf,$nread,$raw_str); $raw_str = '';
-    while ( $nread=sysread($fd,$inbuf,16384) ) { $raw_str .= $inbuf }
+    # dbg("message: (raw) reading mime part from a temporary file");
+    my($nread,$raw_str); $raw_str = '';
+    while ( $nread=sysread($fd, $raw_str, 16384, length $raw_str) ) { }
     defined $nread  or die "error reading: $!";
     my @array = split(/^/m, $raw_str, -1);
 
@@ -308,8 +320,9 @@ sub decode {
       my $fd = $self->{'raw'};
       seek($fd, 0, 0)  or die "message: cannot rewind file: $!";
 
-      my($inbuf,$nread,$raw_str); $raw = '';
-      while ( $nread=sysread($fd,$inbuf,16384) ) { $raw .= $inbuf }
+      # dbg("message: (decode) reading mime part from a temporary file");
+      my($nread,$raw_str); $raw = '';
+      while ( $nread=sysread($fd, $raw, 16384, length $raw) ) { }
       defined $nread  or die "error reading: $!";
 
       dbg("message: empty message read from a temp file")  if $raw eq '';
@@ -383,29 +396,182 @@ sub _html_render {
   return 0;
 }
 
+# Decode character set of a given text to perl characters (Unicode),
+# then encode into UTF-8 octets if requested.
+#
 sub _normalize {
-  my ($self, $data, $charset) = @_;
-  return $data unless $self->{normalize};
+# my $data = $_[0];  # avoid copying large strings
+  my $charset_declared = $_[1];
+  my $return_decoded = $_[2];  # true: Unicode characters, false: UTF-8 octets
+  my $insist_on_declared_charset = $_[3];  # no FB_CROAK in Encode::decode
 
-  my $detected = Encode::Detect::Detector::detect($data);
+  warn "message: _normalize() was given characters, expected bytes: $_[0]\n"
+    if utf8::is_utf8($_[0]);
 
-  my $converter;
+  # workaround for Encode::decode taint laundering bug [rt.cpan.org #84879]
+  my $data_taint = substr($_[0], 0, 0);  # empty string, tainted like $data
 
-  if ($charset && $charset !~ /^us-ascii$/i &&
-      ($detected || 'none') !~ /^(?:UTF|EUC|ISO-2022|Shift_JIS|Big5|GB)/i) {
-      dbg("message: Using labeled charset $charset");
-      $converter = Encode::find_encoding($charset);
+  if (!defined $charset_declared || $charset_declared eq '') {
+    $charset_declared = 'us-ascii';
   }
 
-  $converter = Encode::find_encoding($detected) unless $converter || !defined($detected);
+  # number of characters with code above 127
+  my $cnt_8bits = $_[0] =~ tr/\x00-\x7F//c;
 
-  return $data unless $converter;
+  if (!$cnt_8bits &&
+      $charset_declared =~
+        /^(?: (?:US-)?ASCII | ANSI[_ ]? X3\.4- (?:1986|1968) |
+              ISO646-US )\z/xsi)
+  { # declared as US-ASCII (a.k.a. ANSI X3.4-1986) and it really is
+    dbg("message: kept, charset is US-ASCII as declared");
+    return $_[0];  # is all-ASCII, no need for decoding
+  }
 
-  dbg("message: Converting...");
+  if (!$cnt_8bits &&
+      $charset_declared =~
+        /^(?: ISO[ -]?8859 (?: - \d{1,2} )? | Windows-\d{4} |
+              UTF-?8 | (KOI8|EUC)-[A-Z]{1,2} |
+              Big5 | GBK | GB[ -]?18030 (?:-20\d\d)? )\z/xsi)
+  { # declared as extended ASCII, but it is actually a plain 7-bit US-ASCII
+    dbg("message: kept, charset is US-ASCII, declared %s", $charset_declared);
+    return $_[0];  # is all-ASCII, no need for decoding
+  }
 
-  my $rv = $converter->decode($data, 0);
-  utf8::downgrade($rv, 1);
-  return $rv
+  # Try first to strictly decode based on a declared character set.
+
+  my $rv;
+  if ($cnt_8bits && !$insist_on_declared_charset &&
+      eval { $rv = $enc_utf8->decode($_[0], 1|8); defined $rv }) {
+    dbg("message: decoded as charset UTF-8, declared %s", $charset_declared);
+    return $_[0]  if !$return_decoded;
+    $rv .= $data_taint;  # carry taintedness over, avoid Encode bug
+    return $rv;  # decoded
+
+  } elsif ($charset_declared =~ /^(?:US-)?ASCII\z/i
+           && !$insist_on_declared_charset) {
+    # declared as US-ASCII but contains 8-bit characters, makes no sense
+    # to attempt decoding first as strict US-ASCII as we know it would fail
+
+  } else {
+    # try decoding as a declared character set
+
+    # ->  http://en.wikipedia.org/wiki/Windows-1252
+    # Windows-1252 character encoding is a superset of ISO 8859-1, but differs
+    # from the IANA's ISO-8859-1 by using displayable characters rather than
+    # control characters in the 80 to 9F (hex) range. [...]
+    # It is very common to mislabel Windows-1252 text with the charset label
+    # ISO-8859-1. A common result was that all the quotes and apostrophes
+    # (produced by "smart quotes" in word-processing software) were replaced
+    # with question marks or boxes on non-Windows operating systems, making
+    # text difficult to read. Most modern web browsers and e-mail clients
+    # treat the MIME charset ISO-8859-1 as Windows-1252 to accommodate
+    # such mislabeling. This is now standard behavior in the draft HTML 5
+    # specification, which requires that documents advertised as ISO-8859-1
+    # actually be parsed with the Windows-1252 encoding.
+    #
+    my($chset, $decoder);
+    if ($charset_declared =~ /^(?: ISO-?8859-1 | Windows-1252 | CP1252 )\z/xi) {
+      $chset = 'Windows-1252'; $decoder = $enc_w1252;
+    } elsif ($charset_declared =~ /^UTF-?8\z/i) {
+      $chset = 'UTF-8'; $decoder = $enc_utf8;
+    } else {
+      $chset = $charset_declared;
+      $decoder = Encode::find_encoding($chset);
+      if (!$decoder && $chset =~ /^GB[ -]?18030(?:-20\d\d)?\z/i) {
+        $decoder = Encode::find_encoding('GBK');  # a subset of GB18030
+        dbg("message: no decoder for a declared charset %s, using GBK",
+            $chset)  if $decoder;
+      }
+    }
+    if (!$decoder) {
+      dbg("message: failed decoding, no decoder for a declared charset %s",
+          $chset);
+    } else {
+      my $check_flags = Encode::LEAVE_SRC;  # 0x0008
+      $check_flags |= Encode::FB_CROAK  unless $insist_on_declared_charset;
+      eval { $rv = $decoder->decode($_[0], $check_flags) };
+      if (lc $chset eq lc $charset_declared) {
+        dbg("message: %s as declared charset %s",
+            defined $rv ? 'decoded' : 'failed decoding', $charset_declared);
+      } else {
+        dbg("message: %s as charset %s, declared %s",
+            defined $rv ? 'decoded' : 'failed decoding',
+            $chset, $charset_declared);
+      }
+    }
+  }
+
+  # If the above failed, check if it is US-ASCII, possibly extended by few
+  # NBSP or SHY characters from ISO-8859-* or Windows-1252, or containing
+  # some popular punctuation or special characters from Windows-1252 in
+  # the \x80-\x9F range (which is unassigned in ISO-8859-*).
+  # Note that Windows-1252 is a proper superset of ISO-8859-1.
+  #
+  if (!defined $rv && !$cnt_8bits) {
+    dbg("message: kept, guessed charset is US-ASCII, declared %s",
+        $charset_declared);
+    return $_[0];  # is all-ASCII, no need for decoding
+
+  } elsif (!defined $rv && $enc_w1252 &&
+      #             ASCII  NBSP (c) SHY  '   "  ...   '".-   TM
+      $_[0] !~ tr/\x00-\x7F\xA0\xA9\xAD\x82\x84\x85\x91-\x97\x99//c)
+  { # ASCII + NBSP + SHY + some punctuation characters
+    # NBSP (A0) and SHY (AD) are at the same position in ISO-8859-* too
+    # consider also: AE (r), 80 Euro
+    eval { $rv = $enc_w1252->decode($_[0], 1|8) };  # FB_CROAK | LEAVE_SRC
+    # the above can't fail, but keep code general just in case
+    dbg("message: %s as guessed charset %s, declared %s",
+        defined $rv ? 'decoded' : 'failed decoding',
+        'Windows-1252', $charset_declared);
+  }
+
+  # If we were unsuccessful so far, try some guesswork
+  # based on Encode::Detect::Detector .
+
+  if (defined $rv) {
+    # done, no need for guesswork
+  } elsif (!$have_encode_detector) {
+    dbg("message: Encode::Detect::Detector not available, declared %s failed",
+        $charset_declared);
+  } else {
+    my $charset_detected = Encode::Detect::Detector::detect($_[0]);
+    if ($charset_detected && lc $charset_detected ne lc $charset_declared) {
+      my $decoder = Encode::find_encoding($charset_detected);
+      if (!$decoder && $charset_detected =~ /^GB[ -]?18030(?:-20\d\d)?\z/i) {
+        $decoder = Encode::find_encoding('GBK');  # a subset of GB18030
+        dbg("message: no decoder for a detected charset %s, using GBK",
+            $charset_detected)  if $decoder;
+      }
+      if (!$decoder) {
+        dbg("message: failed decoding, no decoder for a detected charset %s",
+            $charset_detected);
+      } else {
+        eval { $rv = $decoder->decode($_[0], 1|8) };  # FB_CROAK | LEAVE_SRC
+        dbg("message: %s as detected charset %s, declared %s",
+            defined $rv ? 'decoded' : 'failed decoding',
+            $charset_detected, $charset_declared);
+      }
+    }
+  }
+
+  if (!defined $rv) {  # all decoding attempts failed so far, probably garbage
+    # go for Windows-1252 which can't fail
+    eval { $rv = $enc_w1252->decode($_[0]) };
+    dbg("message: %s as last-resort charset %s, declared %s",
+        defined $rv ? 'decoded' : 'failed decoding',
+        'Windows-1252', $charset_declared);
+  }
+
+  if (!defined $rv) {  # just in case - all decoding attempts failed so far
+    return $_[0];  # garbage-in / garbage-out, return unchanged octets
+  }
+  # decoding octets to characters was successful
+  if (!$return_decoded) {
+    # utf8::encode() is much faster than $enc_utf8->encode on utf8-flagged arg
+    utf8::encode($rv);  # encode Unicode characters to UTF-8 octets
+  }
+  $rv .= $data_taint;  # carry taintedness over, avoid Encode bug
+  return $rv;
 }
 
 =item rendered()
@@ -428,19 +594,51 @@ sub rendered {
     # text/x-aol is ignored here, but looks like text/html ...
     return(undef,undef) unless ( $self->{'type'} =~ /^text\/(?:plain|html)$/i );
 
-    my $text = $self->_normalize($self->decode(), $self->{charset});
-    my $raw = length($text);
+    my $text = $self->decode;  # QP and Base64 decoding, bytes
+    my $text_len = length($text);  # num of bytes in original charset encoding
 
     # render text/html always, or any other text|text/plain part as text/html
     # based on a heuristic which simulates a certain common mail client
-    if ($raw > 0 && ($self->{'type'} =~ m@^text/html$@i ||
-		     ($self->{'type'} =~ m@^text/plain$@i &&
-		      _html_render(substr($text, 0, 23)))))
+    if ($text ne '' && ($self->{'type'} =~ m{^text/html$}i ||
+		        ($self->{'type'} =~ m{^text/plain$}i &&
+		         _html_render(substr($text, 0, 23)))))
     {
       $self->{rendered_type} = 'text/html';
 
-      my $html = Mail::SpamAssassin::HTML->new();	# object
-      $html->parse($text);				# parse+render text
+      # will input text to HTML::Parser be provided as Unicode characters?
+      my $character_semantics = 0;  # $text is in bytes
+      if ($self->{normalize} && $enc_utf8) {  # charset decoding requested
+        # Provide input to HTML::Parser as Unicode characters
+        # which avoids a HTML::Parser bug in utf8_mode
+        #   https://rt.cpan.org/Public/Bug/Display.html?id=99755
+        #   Note: the above bug was fixed in HTML-Parser 3.72, January 2016.
+        # Avoid unnecessary step of encoding-then-decoding by telling
+        # subroutine _normalize() to return Unicode text.  See Bug 7133
+        #
+        $character_semantics = 1;  # $text will be in characters
+        $text = _normalize($text, $self->{charset}, 1); # bytes to chars
+      } elsif (!defined $self->{charset} ||
+               $self->{charset} =~ /^(?:US-ASCII|UTF-8)\z/i) {
+        if ($text !~ tr/\x00-\x7F//c) {
+          # all-ASCII, keep as octets (utf8 flag off)
+        } else { # non-ASCII, try UTF-8
+          my $rv;
+          # with some luck input can be interpreted as UTF-8
+          if (eval { $rv = $enc_utf8->decode($text, 1|8); defined $rv }) {
+            $text = $rv;  # decoded to perl characters
+            $character_semantics = 1;  # $text will be in characters
+          };
+        }
+      } else {
+        dbg("message: 'normalize_charset' is off, encoding will likely ".
+            "be misinterpreted; declared charset: %s", $self->{charset});
+      }
+      # the 1 requires decoded HTML results to be in characters (utf8 flag on)
+      my $html = Mail::SpamAssassin::HTML->new($character_semantics,1); # object
+
+      $html->parse($text);  # parse+render text
+
+      # resulting HTML-decoded text is in perl characters (utf8 flag on)
       $self->{rendered} = $html->get_rendered_text();
       $self->{visible_rendered} = $html->get_rendered_text(invisible => 0);
       $self->{invisible_rendered} = $html->get_rendered_text(invisible => 1);
@@ -450,14 +648,42 @@ sub rendered {
       my $r = $self->{html_results};	# temporary reference for brevity
 
       # count the number of spaces in the rendered text
-      my $rt = pack "C0A*", $self->{rendered};
-      my $space = ($rt =~ tr/ \t\n\r\x0b\xa0/ \t\n\r\x0b\xa0/);
-      $r->{html_length} = length($rt);
+      my $space;
+      if (utf8::is_utf8($self->{rendered})) {
+        my $str = $self->{rendered};
+        $str =~ s/\S+//g;  # delete non-whitespace Unicode characters
+        $space = length $str;  # count remaining Unicode space characters
+        undef $str;  # deallocate storage
+        dbg("message: spaces (Unicode) in HTML: %d out of %d%s",
+            $space, length $self->{rendered},
+            $character_semantics ? '' : ', octets!?');
+      } else {
+        $space = $self->{rendered} =~ tr/ \t\n\r\x0b//;
+        dbg("message: spaces (octets) in HTML: %d out of %d%s",
+            $space, length $self->{rendered},
+            $character_semantics ? ', chars!?' : '');
+      }
+      # we may want to add the count of other Unicode whitespace characters
 
+      $r->{html_length} = length $self->{rendered};  # perl characters count
       $r->{non_space_len} = $r->{html_length} - $space;
-      $r->{ratio} = ($raw - $r->{html_length}) / $raw;
+      $r->{ratio} = ($text_len - $r->{html_length}) / $text_len  if $text_len;
     }
-    else {
+
+    else {  # plain text
+      if ($self->{normalize} && $enc_utf8) {
+        # request transcoded result as UTF-8 octets!
+        $text = _normalize($text, $self->{charset}, 1); # bytes to chars
+      } elsif (!defined $self->{charset} ||
+               $self->{charset} =~ /^(?:US-ASCII|UTF-8)\z/i) {
+        if ($text =~ tr/\x00-\x7F//c) {  # non-ASCII, try UTF-8
+          my $rv;
+          # with some luck input can be interpreted as UTF-8
+          if (eval { $rv = $enc_utf8->decode($text, 1|8); defined $rv }) {
+            $text = $rv;  # decoded to perl characters
+          };
+        }
+      }
       $self->{rendered_type} = $self->{type};
       $self->{rendered} = $self->{'visible_rendered'} = $text;
       $self->{'invisible_rendered'} = '';
@@ -559,15 +785,15 @@ sub delete_header {
   $self->{'header_order'} = \@neworder;
 }
 
-# decode a header appropriately.  don't bother adding it to the pod documents.
-sub __decode_header {
-  my ( $self, $encoding, $cte, $data ) = @_;
+# decode 'encoded-word' (RFC 2047, RFC 2231)
+sub _decode_mime_encoded_word {
+  my ( $encoding, $cte, $data ) = @_;
 
-  if ( $cte eq 'B' ) {
+  if ( uc $cte eq 'B' ) {
     # base 64 encoded
     $data = Mail::SpamAssassin::Util::base64_decode($data);
   }
-  elsif ( $cte eq 'Q' ) {
+  elsif ( uc $cte eq 'Q' ) {
     # quoted printable
 
     # the RFC states that in the encoded text, "_" is equal to "=20"
@@ -577,46 +803,111 @@ sub __decode_header {
   }
   else {
     # not possible since the input has already been limited to 'B' and 'Q'
-    die "message: unknown encoding type '$cte' in RFC2047 header";
+    die "message: unknown encoding type '$cte' in RFC 2047 header";
   }
-  return $self->_normalize($data, $encoding);
+
+  if (defined $encoding) {
+    # RFC 2231 section 5: Language specification in Encoded Words
+    #   =?US-ASCII*EN?Q?Keith_Moore?=
+    # strip optional language information following an asterisk
+    $encoding =~ s{ \* .* \z }{}xs;
+
+    $data = _normalize($data, $encoding, 0, 1);  # transcode to UTF-8 octets
+  }
+  # dbg("message: _decode_mime_encoded_word (%s, %s): %s",
+  #     $cte, $encoding || '-', $data);
+
+  return $data;  # as UTF-8 octets
 }
 
-# Decode base64 and quoted-printable in headers according to RFC2047.
+# Decode base64 and quoted-printable in headers according to RFC 2047.
 #
 sub _decode_header {
-  my($self, $header_field_body, $header_field_name) = @_;
+  my($header_field_body, $header_field_name) = @_;
 
   return '' unless defined $header_field_body && $header_field_body ne '';
 
   # deal with folding and cream the newlines and such
-  $header_field_body =~ s/\n[ \t]+/\n /g;
+  $header_field_body =~ s/\n[ \t]/\n /g;  # turning tab into space on folds
   $header_field_body =~ s/\015?\012//gs;
 
-  # Bug 6945: some header fields must not be processed for MIME encoding
-  if ($header_field_name =~
-       /^ (?: (?: Received | (?:Resent-)? (?: Message-ID | Date ) |
-                  MIME-Version | References | In-Reply-To ) \z
-            | (?: List- | Content- ) ) /xsi ) {
-    return $header_field_body;
+  if ($header_field_body =~ tr/\x00-\x7F//c) {
+    # Non-ASCII characters in header are not allowed by RFC 5322, but
+    # RFC 6532 relaxed the rule and allows UTF-8 encoding in header
+    # field bodies; no other encoding is allowed there (apart from
+    # RFC 2047 MIME encoded words, which must be all-ASCII anyway).
+    # The following call keeps UTF-8 octets if valid, otherwise tries
+    # some decoding guesswork so that the result is valid UTF-8 (octets).
+    $header_field_body = _normalize($header_field_body, 'UTF-8', 0);
   }
 
-  # multiple encoded sections must ignore the interim whitespace.
-  # to avoid possible FPs with (\s+(?==\?))?, look for the whole RE
-  # separated by whitespace.
-  1 while ($header_field_body =~ s/(=\?[\w_-]+\?[bqBQ]\?[^?]+\?=)\s+(=\?[\w_-]+\?[bqBQ]\?[^?]+\?=)/$1$2/g);
+  if ($header_field_name =~
+       /^ (?: Received | (?:Resent-)? (?: Message-ID | Date ) |
+              MIME-Version | References | In-Reply-To | List-.* ) \z /xsi ) {
+    # Bug 6945: some header fields must not be processed for MIME encoding
+    # Bug 7249: leave out the Content-*
 
-# unless ($header_field_body =~
-#	  s/=\?([\w_-]+)\?([bqBQ])\?([^?]+)\?=/$self->__decode_header($1, uc($2), $3)/ge) {
-#   $header_field_body = $self->_normalize($header_field_body);
-# }
+  } elsif ($header_field_body =~ /=\?/) {  # triage for possible encoded-words
+    local($1,$2,$3,$4);
 
-  # Bug 6945: header fields have no inherent character set;
-  # only decode and normalize properly encoded RFC 2047 substrings,
-  # leave the rest as plain octets
-  $header_field_body =~ s{ = \? ([A-Za-z0-9_-]+) \? ([bqBQ]) \? ([^?]+) \? = }
-                         { $self->__decode_header($1, uc($2), $3) }xge;
+    # Multiple encoded sections must ignore the interim whitespace.
+    # To avoid possible FPs with (\s+(?==\?))?, look for the whole RE
+    # separated by whitespace.
+    $header_field_body =~
+      s{ (   = \? [A-Za-z0-9*_-]+ \? [bqBQ] \? [^?]* \? = ) \s+
+         (?= = \? [A-Za-z0-9*_-]+ \? [bqBQ] \? [^?]* \? = ) }{$1}xsg;
 
+    # Bug 7249: work around violations of the RFC 2047 section 5 requirement:
+    #   Each 'encoded-word' MUST represent an integral number of characters.
+    #   A multi-octet character may not be split across adjacent 'encoded-word's
+    # Unfortunately such violations are not uncommon.
+    #
+    # Bug 7307: to deal with the above, base64/QP decoding must be decoupled
+    # from decoding a specified multi-byte character set into UTF-8.
+    # A previous simpler code could not handle base64 fill bits correctly
+    # (merging of adjecent encoded sections before base64/QP decoding them).
+
+    my @sections;  # array of pairs: [string, encoding]
+    my $last_encoding = '';
+    while ( $header_field_body =~
+              m{ \G = \? ([A-Za-z0-9*_-]+) \? ([bqBQ]) \? ([^?]*) \? =
+                  | ( [^=]+ | . ) }xsg ) {
+      my($encoding, $str);
+      if (defined $1) {  # we have an encoded section
+        $encoding = lc $1;
+        # decode base64 / QP decoding, remember encoding charset
+        $str = _decode_mime_encoded_word(undef, $2, $3);
+      } else {  # non-encoded text
+        $encoding = '';
+        $str = $4;
+      }
+      if ($encoding eq $last_encoding && @sections) {
+        # merge sections with same encoding - in violation of RFC 2047 sect.5
+        $sections[$#sections]->[0] .= $str;
+      } else {
+        push(@sections, [$str, $encoding]);
+      }
+      $last_encoding = $encoding;
+    }
+
+    # transcode encoded RFC 2047 substrings (already base64/QP-decoded)
+    # into UTF-8 octets, leave everything else unchanged as it is supposed
+    # to be UTF-8 (RFC 6532) or its plain US-ASCII subset (RFC 5322);
+    #
+    my $decoded_result = '';
+    for my $sect (@sections) {
+      my $encoding = $sect->[1];
+      # RFC 2231 section 5: Language specification in Encoded Words
+      #   =?US-ASCII*EN?Q?Keith_Moore?=
+      # strip optional language information following an asterisk
+      $encoding =~ s{ \* .* \z }{}xs;
+      $decoded_result .=
+        $encoding eq '' ? $sect->[0] : _normalize($sect->[0], $encoding, 0, 1);
+    }
+    $header_field_body = $decoded_result;
+  }
+
+  dbg("message: _decode_header %s: %s", $header_field_name, $header_field_body);
   return $header_field_body;
 }
 

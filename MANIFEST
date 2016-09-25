@@ -93,6 +93,7 @@ lib/Mail/SpamAssassin/Plugin/MIMEEval.pm
 lib/Mail/SpamAssassin/Plugin/MIMEHeader.pm
 lib/Mail/SpamAssassin/Plugin/OneLineBodyRuleType.pm
 lib/Mail/SpamAssassin/Plugin/PhishTag.pm
+lib/Mail/SpamAssassin/Plugin/PDFInfo.pm
 lib/Mail/SpamAssassin/Plugin/Pyzor.pm
 lib/Mail/SpamAssassin/Plugin/Razor2.pm
 lib/Mail/SpamAssassin/Plugin/RelayCountry.pm
@@ -114,6 +115,7 @@ lib/Mail/SpamAssassin/Plugin/WLBLEval.pm
 lib/Mail/SpamAssassin/Plugin/WhiteListSubject.pm
 lib/Mail/SpamAssassin/PluginHandler.pm
 lib/Mail/SpamAssassin/Plugin/URILocalBL.pm
+lib/Mail/SpamAssassin/RegistryBoundaries.pm
 lib/Mail/SpamAssassin/Reporter.pm
 lib/Mail/SpamAssassin/SQLBasedAddrList.pm
 lib/Mail/SpamAssassin/SpamdForkScaling.pm
@@ -140,6 +142,7 @@ rules/v320.pre
 rules/v330.pre
 rules/v340.pre
 rules/v341.pre
+rules/20_aux_tlds.cf
 sa-awl.raw
 sa-check_spamd.raw
 sa-compile.raw
@@ -208,12 +211,15 @@ spamd/suse-ancient-rc-script.sh
 sql/README
 sql/README.awl
 sql/README.bayes
+sql/README.txrep
 sql/awl_mysql.sql
 sql/awl_pg.sql
 sql/bayes_mysql.sql
 sql/bayes_pg.sql
 sql/userpref_mysql.sql
 sql/userpref_pg.sql
+sql/txrep_mysql.sql
+sql/txrep_pg.sql
 t/README
 t/SATest.pl
 t/SATest.pm
@@ -332,6 +338,8 @@ t/data/nice/spf1
 t/data/nice/spf2
 t/data/nice/spf3
 t/data/nice/spf3-received-spf
+t/data/nice/unicode1
+t/data/nice/unicode2
 t/data/reporterplugin.pm
 t/data/spam/001
 t/data/spam/002
@@ -411,9 +419,11 @@ t/get_all_headers.t
 t/get_headers.t
 t/gtube.t
 t/hashcash.t
+t/header_utf8.t
 t/html_colors.t
 t/html_obfu.t
 t/html_utf8.t
+t/idn_dots.t
 t/if_can.t
 t/ifversion.t
 t/ip_addrs.t
@@ -504,8 +514,6 @@ t/spamd_report_ifspam.t
 t/spamd_sql_prefs.t
 t/spamd_ssl.t
 t/spamd_ssl_accept_fail.t
-t/spamd_ssl_tls.t
-t/spamd_ssl_v3.t
 t/spamd_stop.t
 t/spamd_symbols.t
 t/spamd_syslog.t
@@ -543,3 +551,8 @@ t/data/spam/dnsbl_ipsonly.eml
 t/uribl_all_types.t
 t/uribl_ips_only.t
 t/dnsbl_subtests.t
+powered_by/128-powered-by-spamassassin.png
+powered_by/256-powered-by-spamassassin.png
+powered_by/512-powered-by-spamassassin.png
+powered_by/LOGO_USAGE.TXT
+powered_by/powered_by_spamassassin.psd

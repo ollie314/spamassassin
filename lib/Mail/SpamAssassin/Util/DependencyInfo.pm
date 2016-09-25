@@ -31,23 +31,15 @@ package Mail::SpamAssassin::Util::DependencyInfo;
 
 use strict;
 use warnings;
-use bytes;
+# use bytes;
 use re 'taint';
 
 use vars qw (
   @MODULES @OPTIONAL_MODULES $EXIT_STATUS $WARNINGS @OPTIONAL_BINARIES @BINARIES
 );
 
-my $have_sha  = eval { require Digest::SHA  };
-my $have_sha1 = eval { require Digest::SHA1 };
-
 @MODULES = (
-$have_sha1 ? {
-  'module' => 'Digest::SHA1',
-  'version' => 0,
-  'desc' => 'The Digest::SHA1 module is used as a cryptographic hash for some
-  tests and the Bayes subsystem.  It is also required by the Razor2 plugin.',
-} : {
+{
   'module' => 'Digest::SHA',
   'version' => 0,
   'desc' => 'The Digest::SHA module is used as a cryptographic hash for some
@@ -103,14 +95,11 @@ $have_sha1 ? {
 );
 
 my @OPTIONAL_MODULES = (
-$have_sha ? {
+{
   'module' => 'Digest::SHA1',
   'version' => 0,
-  'desc' => 'The Digest::SHA1 module is required by the Razor2 plugin.',
-} : {
-  'module' => 'Digest::SHA',
-  'version' => 0,
-  'desc' => 'The Digest::SHA module is required by the DKIM plugin.',
+  'desc' => 'The Digest::SHA1 module is still required by the Razor2 plugin.
+  Other modules prefer Digest::SHA, which is a Perl base module.',
 },
 {
   module => 'MIME::Base64',
@@ -130,6 +119,14 @@ $have_sha ? {
   alt_name => 'libnet',
   version => 0,
   desc => 'Used when manually reporting spam to SpamCop with "spamassassin -r".',
+},
+{
+  'module' => 'Net::LibIDN',
+  'version' => 0,
+  'desc' => "Provides mapping between Internationalized Domain Names (IDN) in
+  Unicode and ASCII-compatible encoding (ACE) for use in DNS and comparisions.
+  The module is optional, but without it Unicode IDN names found in mail will
+  not be suitable for DNS queries and white/blacklisting.",
 },
 {
   module => 'Mail::SPF',
@@ -241,11 +238,13 @@ $have_sha ? {
   If-Modified-Since GET requests.',
 },
 {
-  module => 'Encode::Detect',
+  module => 'Encode::Detect::Detector',
   version => 0,
-  desc => 'If you plan to use the normalize_charset config setting to detect
-  charsets and convert them into Unicode, you will need to install
-  this module.',
+  desc => 'If you plan to use the normalize_charset config setting to
+  decode message parts from their declared character set into Unicode, and
+  such decoding fails, the Encode::Detect::Detector module (when available)
+  may be consulted to provide an alternative guess on a character set of a
+  problematic message part.',
 },
 {
   module => 'Net::Patricia',

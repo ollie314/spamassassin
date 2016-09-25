@@ -23,7 +23,7 @@ use Mail::SpamAssassin::Constants qw(:ip);
 
 use strict;
 use warnings;
-use bytes;
+# use bytes;
 use re 'taint';
 
 use vars qw(@ISA);
@@ -88,6 +88,7 @@ sub check_for_numeric_helo {
     my $IP_ADDRESS = IPV4_ADDRESS;
     my $IP_PRIVATE = IP_PRIVATE;
     local $1;
+    # no re "strict";  # since perl 5.21.8: Ranges of ASCII printables...
     if ($rcvd =~ /\bhelo=($IP_ADDRESS)(?=[\000-\040,;\[()<>]|\z)/i  # Bug 5878
         && $1 !~ /$IP_PRIVATE/) {
       return 1;

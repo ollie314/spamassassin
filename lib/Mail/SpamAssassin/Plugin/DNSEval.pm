@@ -31,7 +31,7 @@ use Mail::SpamAssassin::Util qw(reverse_ip_address);
 
 use strict;
 use warnings;
-use bytes;
+# use bytes;
 use re 'taint';
 
 use vars qw(@ISA);
@@ -324,6 +324,8 @@ sub check_rbl_from_host {
 =item check_rbl_from_domain
 
 This checks all the from addrs domain names as an alternate to check_rbl_from_host.  As of v3.4.1, it has been improved to include a subtest for a specific octet.
+
+=back
 
 =cut
 sub check_rbl_from_domain {

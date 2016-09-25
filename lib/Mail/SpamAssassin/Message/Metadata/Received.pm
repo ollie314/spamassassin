@@ -43,7 +43,7 @@ package Mail::SpamAssassin::Message::Metadata::Received; 1;
 package Mail::SpamAssassin::Message::Metadata;
 use strict;
 use warnings;
-use bytes;
+# use bytes;
 use re 'taint';
 
 use Mail::SpamAssassin::Dns;
@@ -434,12 +434,17 @@ sub parse_received_line {
     $auth = 'Postfix';
   }
   # Communigate Pro - Bug 6495 adds HTTP as possible transmission method
-  elsif (/CommuniGate Pro (HTTP|SMTP)/ && / \(account /) {
+  # 	Bug 7277: XIMSS used by Pronto and other custom apps, IMAP supports XMIT extension
+  elsif (/CommuniGate Pro (HTTP|SMTP|XIMSS|IMAP)/ && / \(account /) {
     $auth = 'Communigate';
   }
   # Microsoft Exchange (complete with syntax error)
   elsif (/ with Microsoft Exchange Server HTTP-DAV\b/) {
     $auth = 'HTTP-DAV';
+  }
+  # froufrou mailers like United Internet use a '(via HTTP)' comment, Bug 7101
+  elsif (/ by / && / \(via (HTTP.?)\)(?: |;|$)/i) {
+    $auth = $1;
   }
 
 # ---------------------------------------------------------------------------
@@ -710,6 +715,11 @@ sub parse_received_line {
     # Received: from sc8-sf-sshgate.sourceforge.net (HELO sc8-sf-netmisc.sourceforge.net) (66.35.250.220) by la.mx.develooper.com (qpsmtpd/0.27-dev) with ESMTP; Fri, 02 Jan 2004 14:44:41 -0800
     # Received: from mx10.topofferz.net (HELO ) (69.6.60.10) by blazing.arsecandle.org with SMTP; 3 Mar 2004 20:34:38 -0000
     if (/^(\S+) \((?:HELO|EHLO) (\S*)\) \((${IP_ADDRESS})\) by (\S+) \(qpsmtpd\/\S+\) with (?:ESMTP|SMTP)/) {
+      $rdns = $1; $helo = $2; $ip = $3; $by = $4; goto enough;
+    }
+
+    # Received: from mail-backend.DDDD.com (LHLO mail-backend.DDDD.com) (10.2.2.20) by mail-backend.DDDD.com with LMTP; Thu, 18 Jun 2015 16:50:56 -0700 (PDT)
+    if (/^(\S+) \(LHLO (\S*)\) \((${IP_ADDRESS})\) by (\S+) with LMTP/) {
       $rdns = $1; $helo = $2; $ip = $3; $by = $4; goto enough;
     }
 
@@ -1177,7 +1187,7 @@ sub parse_received_line {
     # logging a little more.
     if (/^\S+ by \S+ \(.{0,100}\) with qmail-scanner/) {
       $envfrom =~ s/^\s*<*//gs; $envfrom =~ s/>*\s*$//gs;
-      $envfrom =~ s/[\s\0\#\[\]\(\)\<\>\|]/!/gs;
+      $envfrom =~ s/[\s\000\#\[\]\(\)\<\>\|]/!/gs;
       $self->{qmail_scanner_env_from} = $envfrom; # hack!
       return 0;
     }
@@ -1307,12 +1317,12 @@ enough:
   # presence, though.  NOTE: this means "[1.2.3.4]" IP addr HELO
   # strings, which are legit by RFC-2821, look like "!1.2.3.4!".
   # still useful though.
-  $ip =~ s/[\s\0\#\[\]\(\)\<\>\|]/!/gs;
-  $rdns =~ s/[\s\0\#\[\]\(\)\<\>\|]/!/gs;
-  $helo =~ s/[\s\0\#\[\]\(\)\<\>\|]/!/gs;
-  $by =~ s/[\s\0\#\[\]\(\)\<\>\|]/!/gs;
-  $ident =~ s/[\s\0\#\[\]\(\)\<\>\|]/!/gs;
-  $envfrom =~ s/[\s\0\#\[\]\(\)\<\>\|]/!/gs;
+  $ip =~ s/[\s\000\#\[\]\(\)\<\>\|]/!/gs;
+  $rdns =~ s/[\s\000\#\[\]\(\)\<\>\|]/!/gs;
+  $helo =~ s/[\s\000\#\[\]\(\)\<\>\|]/!/gs;
+  $by =~ s/[\s\000\#\[\]\(\)\<\>\|]/!/gs;
+  $ident =~ s/[\s\000\#\[\]\(\)\<\>\|]/!/gs;
+  $envfrom =~ s/[\s\000\#\[\]\(\)\<\>\|]/!/gs;
 
   my $relay = {
     ip => $ip,

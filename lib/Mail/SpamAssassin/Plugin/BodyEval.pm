@@ -23,7 +23,7 @@ use Mail::SpamAssassin::Constants qw(:sa);
 
 use strict;
 use warnings;
-use bytes;
+# use bytes;
 use re 'taint';
 
 use vars qw(@ISA);
@@ -218,6 +218,7 @@ sub tvd_vertical_words {
     }
   }
 
+  dbg("eval: tvd_vertical_words value: $pms->{tvd_vertical_words} / min: $min / max: $max - value must be >= min and < max");
   return 1 if ($pms->{tvd_vertical_words} >= $min && $pms->{tvd_vertical_words} < $max);
 }
 

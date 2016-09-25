@@ -294,12 +294,11 @@ package Mail::SpamAssassin::Plugin::URIDNSBL;
 
 use Mail::SpamAssassin::Plugin;
 use Mail::SpamAssassin::Constants qw(:ip);
-use Mail::SpamAssassin::Util;
-use Mail::SpamAssassin::Util::RegistrarBoundaries;
+use Mail::SpamAssassin::Util qw(idn_to_ascii);
 use Mail::SpamAssassin::Logger;
 use strict;
 use warnings;
-use bytes;
+# use bytes;
 use re 'taint';
 
 use vars qw(@ISA);
@@ -902,6 +901,7 @@ sub query_hosts_or_domains {
 sub lookup_domain_ns {
   my ($self, $pms, $obj, $dom, $rulename) = @_;
 
+  $dom = idn_to_ascii($dom);
   my $key = "NS:" . $dom;
   my $ent = {
     key => $key, zone => $dom, obj => $obj, type => "URI-NS",
@@ -943,9 +943,8 @@ sub complete_ns_lookup {
     next unless (defined($str) && defined($dom));
     dbg("uridnsbl: got($j) NS for $dom: $str");
 
-    if ($str =~ /IN\s+NS\s+(\S+)/) {
-      my $nsmatch = lc $1;
-      $nsmatch =~ s/\.$//;
+    if ($rr->type eq 'NS') {
+      my $nsmatch = lc $rr->nsdname;  # available since at least Net::DNS 0.14
       my $nsrhblstr = $nsmatch;
       my $fullnsrhblstr = $nsmatch;
 
@@ -961,7 +960,7 @@ sub complete_ns_lookup {
           $seen_lookups->{'A:'.$nsmatch} = 1;
           $self->lookup_a_record($pms, $ent->{obj}, $nsmatch);
         }
-        $nsrhblstr = Mail::SpamAssassin::Util::RegistrarBoundaries::trim_domain($nsmatch);
+        $nsrhblstr = $self->{main}->{registryboundaries}->trim_domain($nsmatch);
       }
 
       foreach my $rulename (keys %{$nsrhsblrules}) {
@@ -988,6 +987,7 @@ sub complete_ns_lookup {
 sub lookup_a_record {
   my ($self, $pms, $obj, $hname, $rulename) = @_;
 
+  $hname = idn_to_ascii($hname);
   my $key = "A:" . $hname;
   my $ent = {
     key => $key, zone => $hname, obj => $obj, type => "URI-A",
@@ -1011,25 +1011,19 @@ sub complete_a_lookup {
     dbg("uridnsbl: complete_a_lookup aborted %s", $ent->{key});
     return;
   }
-
   dbg("uridnsbl: complete_a_lookup %s", $ent->{key});
-  my @answer = $pkt->answer;
+  $hname = ''  if !defined $hname;
   my $j = 0;
+  my @answer = $pkt->answer;
   foreach my $rr (@answer) {
     $j++;
-    my $str = $rr->string;
-    if (!defined $hname) {
-      warn "complete_a_lookup-1: $j, (hname is undef), $str";
-    } elsif (!defined $str) {
-      warn "complete_a_lookup-2: $j, $hname, (str is undef)";
-      next;
-    }
-    dbg("uridnsbl: complete_a_lookup got(%d) A for %s: %s", $j,$hname,$str);
-
-    local $1;
-    if ($str =~ /IN\s+A\s+(\S+)/) {
-      $self->lookup_dnsbl_for_ip($pms, $ent->{obj}, $1);
-    }
+    next if $rr->type ne 'A';
+    # Net::DNS::RR::A::address() is available since Net::DNS 0.69
+    my $ip_address = $rr->UNIVERSAL::can('address') ? $rr->address
+                                                    : $rr->rdatastr;
+    dbg("uridnsbl: complete_a_lookup got(%d) A for %s: %s",
+        $j, $hname, $ip_address);
+    $self->lookup_dnsbl_for_ip($pms, $ent->{obj}, $ip_address);
   }
 }
 
@@ -1039,7 +1033,8 @@ sub lookup_dnsbl_for_ip {
   my ($self, $pms, $obj, $ip) = @_;
 
   local($1,$2,$3,$4);
-  $ip =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
+  $ip =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/
+    or warn "lookup_dnsbl_for_ip: not an IPv4 address: $ip\n";
   my $revip = "$4.$3.$2.$1";
 
   my $conf = $pms->{conf};
@@ -1060,6 +1055,9 @@ sub lookup_dnsbl_for_ip {
 
 sub lookup_single_dnsbl {
   my ($self, $pms, $obj, $rulename, $lookupstr, $dnsbl, $qtype) = @_;
+
+  $lookupstr = idn_to_ascii($lookupstr);
+  $dnsbl = idn_to_ascii($dnsbl);
 
   my $key = "DNSBL:" . $lookupstr . ':' . $dnsbl;
   my $ent = {
@@ -1101,15 +1099,18 @@ sub complete_dnsbl_lookup {
     my $rr_type = $rr->type;
 
     if ($rr_type eq 'A') {
-      $rdatastr = $rr->rdatastr;
+      # Net::DNS::RR::A::address() is available since Net::DNS 0.69
+      $rdatastr = $rr->UNIVERSAL::can('address') ? $rr->address
+                                                 : $rr->rdatastr;
       if ($rdatastr =~ m/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/) {
         $rdatanum = Mail::SpamAssassin::Util::my_inet_aton($rdatastr);
       }
     } elsif ($rr_type eq 'TXT') {
-      # txtdata returns a non- zone-file-format encoded result, unlike rdatastr;
+      # txtdata returns a non- zone-file-format encoded result, unlike rdstring;
       # avoid space-separated RDATA <character-string> fields if possible;
       # txtdata provides a list of strings in list context since Net::DNS 0.69
       $rdatastr = join('',$rr->txtdata);
+      utf8::encode($rdatastr)  if utf8::is_utf8($rdatastr);
     } else {
       next;
     }

@@ -245,7 +245,7 @@ use Mail::SpamAssassin::NetSet;
 use Mail::SpamAssassin::SubProcBackChannel;
 use Mail::SpamAssassin::SpamdForkScaling qw(:pfstates);
 use Mail::SpamAssassin::Logger qw(:DEFAULT log_message);
-use Mail::SpamAssassin::Util qw(untaint_var untaint_file_path
+use Mail::SpamAssassin::Util qw(untaint_var untaint_file_path secure_tmpdir
                                 exit_status_str am_running_on_windows);
 use Mail::SpamAssassin::Timeout;
 
@@ -293,8 +293,9 @@ my %resphash = (
 );
 
 sub print_version {
-  printf("%s version %s\n", "SpamAssassin Server", Mail::SpamAssassin::Version());
-  printf("  running on Perl %s\n", join(".", map { $_||=0; $_*1 } ($] =~ /(\d)\.(\d{3})(\d{3})?/)));
+  printf("SpamAssassin Server version %s\n", Mail::SpamAssassin::Version());
+  printf("  running on Perl %s\n",
+         join(".", map( 0+($_||0), ($] =~ /(\d)\.(\d{3})(\d{3})?/) )));
   eval { require IO::Socket::SSL; };
   printf("  with SSL support (%s %s)\n", "IO::Socket::SSL", $IO::Socket::SSL::VERSION) unless ($@);
   eval { require Compress::Zlib; };
@@ -408,12 +409,12 @@ GetOptions(
   'sql-config!'              => \$opt{'sql-config'},
   'ssl'                      => \$opt{'ssl'},
   'ssl-port=s'               => \$opt{'ssl-port'},
-  'ssl-version=s'            => \$opt{'ssl-version'},
   'syslog-socket=s'          => \$opt{'syslog-socket'},
   'syslog|s=s'               => \$opt{'syslog'},
   'log-timestamp-fmt:s'      => \$opt{'log-timestamp-fmt'},
   'timeout-tcp|T=i'          => \$opt{'timeout-tcp'},
   'timeout-child|t=i'        => \$opt{'timeout-child'},
+  'timing'                   => \$opt{'timing'},
   'user-config'              => \$opt{'user-config'},
   'username|u=s'             => \$opt{'username'},
   'version|V'                => \$opt{'version'},
@@ -742,11 +743,6 @@ if ( defined $ENV{'HOME'} ) {
 
 # Do whitelist later in tmp dir. Side effect: this will be done as -u user.
 
-my $sslversion = $opt{'ssl-version'} || 'sslv3';
-if ($sslversion !~ /^(?:sslv3|tlsv1)$/) {
-  die "spamd: invalid ssl-version: $opt{'ssl-version'}\n";
-}
-
 $opt{'server-key'}  ||= "$LOCAL_RULES_DIR/certs/server-key.pem";
 $opt{'server-cert'} ||= "$LOCAL_RULES_DIR/certs/server-cert.pem";
 
@@ -804,7 +800,8 @@ for (@listen_socket_specs) {
            m{^ (?: (ssl) : )?
                (?: \[ ( [^\]]* ) \]
                  | ( [a-z0-9._-]* )
-                 | ( [a-f0-9]* : [a-f0-9]* : [a-f0-9:]* \z )
+                 | ( [a-f0-9]* : [a-f0-9]* : [a-f0-9:]*
+                     (?: % [a-z0-9._~-]* )? \z )
                  | ( \* )
                )?
                (?: : ( [a-z0-9-]* ) )? \z }xsi) {
@@ -896,9 +893,8 @@ sub compose_listen_info_string {
                       $socket_info->{ip_addr}, $socket_info->{port}));
 
     } elsif ($socket->isa('IO::Socket::SSL')) {
-      push(@listeninfo, sprintf("SSL [%s]:%s, ssl version %s",
-                      $socket_info->{ip_addr}, $socket_info->{port},
-                      $opt{'ssl-version'}||'sslv3'));
+      push(@listeninfo, sprintf("SSL [%r]:%s", $socket_info->{ip_addr},
+                      $socket_info->{port}));
     }
   }
 
@@ -1037,15 +1033,15 @@ sub server_sock_setup_inet {
   }
   my($error, @addresses);
   if (!defined $addr || lc $addr eq 'localhost') {  # loopback interface
-    push(@addresses, '127.0.0.1')
-      if $ai_family == &AF_UNSPEC || $ai_family == &AF_INET;
     push(@addresses, '::1')
       if $ai_family == &AF_UNSPEC || $ai_family == &AF_INET6;
-  } elsif ($addr eq '*' || $addr eq '') {  # any address
-    push(@addresses, '0.0.0.0')
+    push(@addresses, '127.0.0.1')
       if $ai_family == &AF_UNSPEC || $ai_family == &AF_INET;
+  } elsif ($addr eq '*' || $addr eq '') {  # any address
     push(@addresses, '::')
       if $ai_family == &AF_UNSPEC || $ai_family == &AF_INET6;
+    push(@addresses, '0.0.0.0')
+      if $ai_family == &AF_UNSPEC || $ai_family == &AF_INET;
   } else {
     ($error, @addresses) = ip_or_name_to_ip_addresses($addr, $ai_family);
   }
@@ -1056,6 +1052,7 @@ sub server_sock_setup_inet {
 
   dbg("spamd: attempting to listen on IP addresses: %s, port %d",
       join(', ',@addresses), $port);
+  my(@diag_succ, @diag_fail);
   for my $adr (@addresses) {
     my %sockopt = (
       LocalAddr => $adr,
@@ -1068,7 +1065,6 @@ sub server_sock_setup_inet {
     $sockopt{V6Only} = 1  if $io_socket_module_name eq 'IO::Socket::IP'
                              && IO::Socket::IP->VERSION >= 0.09;
     %sockopt = (%sockopt, (
-      SSL_version     => $sslversion,
       SSL_verify_mode => 0x00,
       SSL_key_file    => $opt{'server-key'},
       SSL_cert_file   => $opt{'server-cert'},
@@ -1085,15 +1081,36 @@ sub server_sock_setup_inet {
     }
     my $server_inet = $ssl ? IO::Socket::SSL->new(%sockopt)
                            : $io_socket_module_name->new(%sockopt);
-    $server_inet
-      or die sprintf("spamd: could not create %s socket on [%s]:%s: %s\n",
-                     $ssl ? 'IO::Socket::SSL' : $io_socket_module_name,
-                     $adr, $port, $!);
-    push(@listen_sockets, { specs => $socket_specs,
-                            ip_addr => $adr, port => $port,
-                            socket => $server_inet,
-                            fd => $server_inet->fileno }) if $server_inet;
+    my $diag;
+    if (!$server_inet) {
+      $diag = sprintf("could not create %s socket on [%s]:%s: %s",
+                      $ssl ? 'IO::Socket::SSL' : $io_socket_module_name,
+                      $adr, $port, $ssl && $IO::Socket::SSL::SSL_ERROR ?
+                      "$!,$IO::Socket::SSL::SSL_ERROR" : $!);
+      push(@diag_fail, $diag);
+    } else {
+      $diag = sprintf("created %s socket on [%s]:%s",
+                      $ssl ? 'IO::Socket::SSL' : $io_socket_module_name,
+                      $adr, $port);
+      push(@diag_succ, $diag);
+      push(@listen_sockets, { specs => $socket_specs,
+                              ip_addr => $adr, port => $port,
+                              socket => $server_inet,
+                              fd => $server_inet->fileno });
+    }
+    dbg("spamd: %s", $diag);
   }
+  if (!@diag_fail) {
+    # no failures, nothing to report
+  } elsif (@diag_succ) {  # some failures and some success
+    # just warn of all attempts, successful and failed
+    warn "spamd: $_\n"  for @diag_succ;
+    warn "spamd: $_\n"  for @diag_fail;
+  } else {  # all failed, no success
+    warn "spamd: $_\n"  for @diag_fail[0 .. $#diag_fail-1];
+    die  "spamd: $_\n"  for $diag_fail[-1];
+  }
+
   1;
 }
 
@@ -1147,6 +1164,11 @@ my $spamtest = Mail::SpamAssassin->new(
     LOCAL_STATE_DIR => $LOCAL_STATE_DIR
   }
 );
+
+#Enable Timing?
+if ($opt{'timing'}) {
+  $spamtest->timer_enable();
+}
 
 # if $clients_per_child == 1, there's no point in copying configs around
 unless ($clients_per_child > 1) {
@@ -1433,7 +1455,12 @@ sub spawn {
       }
       undef $current_user;
 
-      dbg("timing: " . $spamtest->timer_report()) if would_log('dbg', 'timing');
+      #LOG TIMING
+      if ($opt{'timing'}) {
+        info("timing: " . $spamtest->timer_report());
+      } else {
+        dbg("timing: " . $spamtest->timer_report()) if would_log('dbg', 'timing');
+      }
     }
 
     # If the child lives to get here, it will die ...  Muhaha.
@@ -1809,6 +1836,7 @@ sub parse_msgids {
   my $rmsgid = $mail->get_pristine_header("Resent-Message-Id");
   foreach my $id ((\$msgid, \$rmsgid)) {
     if ( $$id ) {
+      # no re "strict";  # since perl 5.21.8: Ranges of ASCII printables...
       while ( $$id =~ s/\([^\(\)]*\)// )
          { }                           # remove comments and
       $$id =~ s/^\s+|\s+$//g;          # leading and trailing spaces
@@ -1986,9 +2014,11 @@ sub check {
             "rport=".$remote_port);
 
   {
+    # no re "strict";  # since perl 5.21.8: Ranges of ASCII printables...
     my $safe = $msgid; $safe =~ s/[\x00-\x20\s,]/_/gs; push(@extra, "mid=$safe");
   }
   if ($rmsgid) {
+    # no re "strict";  # since perl 5.21.8: Ranges of ASCII printables...
     my $safe = $rmsgid; $safe =~ s/[\x00-\x20\s,]/_/gs; push(@extra, "rmid=$safe");
   }
   if (defined $status->{bayes_score}) {
@@ -2272,12 +2302,15 @@ sub parse_headers {
 sub got_user_header {
   my ( $client, $header, $value ) = @_;
 
-  if ( $value !~ /^([\x20-\xFF]*)$/ ) {
-    protocol_error("(User header contains control chars)");
-    return 0;
+  { # no re "strict";  # since perl 5.21.8: Ranges of ASCII printables...
+    local $1;
+    if ( $value !~ /^([\x20-\xFF]*)$/ ) {
+      protocol_error("(User header contains control chars)");
+      return 0;
+    }
+    $current_user = $1;
   }
 
-  $current_user = $1;
   if ($opt{'auth-ident'} && !auth_ident($current_user)) {
     return 0;
   }
@@ -2388,6 +2421,7 @@ sub got_compress_header {
       return 0;
     }
     $hdrs->{compress_zlib} = 1;
+    dbg("spamd: compress header received\n");
   }
   else {
     protocol_error("(compression type not supported)");
@@ -2992,33 +3026,27 @@ sub ip_is_allowed {
 
 sub preload_modules_with_tmp_homedir {
 
-  # set $ENV{HOME} in /tmp while we compile and preload everything.
-  # File::Spec->tmpdir uses TMPDIR, TMP, TEMP, C:/temp, /tmp etc.
-  my $tmpdir = File::Spec->tmpdir();
-  if ( !$tmpdir ) {
-    die "spamd: cannot find writable tmp dir, set TMP or TMPDIR in environment";
-  }
+  # set $ENV{HOME} in a temp directory while we compile and preload everything.
+  my $tmphome = secure_tmpdir();
 
-  # If TMPDIR isn't set, File::Spec->tmpdir() will set it to undefined.
+  # If TMPDIR isn't set, File::Spec->tmpdir() called by secure_tmpdir() may set it to undefined.
   # that then breaks other things ...
+  # If this is really necessary shouldn't secure_tmpdir() be doing it?
   delete $ENV{'TMPDIR'} if ( !defined $ENV{'TMPDIR'} );
-
-  my $tmphome = File::Spec->catdir( $tmpdir, "spamd-$$-init" );
-  $tmphome = untaint_file_path($tmphome);
 
   my $tmpsadir = File::Spec->catdir( $tmphome, ".spamassassin" );
 
   dbg("spamd: Preloading modules with HOME=$tmphome");
 
-  # bug 5379: spamd won't start if the temp preloading dir exists;
-  # be sure to remove it just in case 
+  if (!-d $tmphome) {
+    die "spamd: cannot create temp directory $tmphome: $!";
+  }
+
+  # bug 5379: spamd won't start if the temp preloading dir exists; check if exists and remove it
+  # This check should be unnecessary now that $tmphome created using File::Temp, but leave it just in case
   if (-d $tmpsadir) {
     rmdir( $tmpsadir ) or die "spamd: $tmpsadir not empty: $!";
   }
-  if (-d $tmphome) {
-    rmdir( $tmphome ) or die "spamd: $tmphome not empty: $!";
-  }
-  mkdir( $tmphome,  0700 ) or die "spamd: cannot create $tmphome: $!";
   mkdir( $tmpsadir, 0700 ) or die "spamd: cannot create $tmpsadir: $!";
   $ENV{HOME} = $tmphome;
 
@@ -3203,13 +3231,13 @@ Options:
  -H [dir], --helper-home-dir[=dir] Specify a different HOME directory
  --ssl                             Enable SSL on TCP connections
  --ssl-port port                   Override --port setting for SSL connections
- --ssl-version sslversion          Specify SSL protocol version to use
  --server-key keyfile              Specify an SSL keyfile
  --server-cert certfile            Specify an SSL certificate
  --socketpath=path                 Listen on a given UNIX domain socket
  --socketowner=name                Set UNIX domain socket file's owner
  --socketgroup=name                Set UNIX domain socket file's group
  --socketmode=mode                 Set UNIX domain socket file's mode
+ --timing                          Enable timing and logging
  -V, --version                     Print version and exit
 
 The --listen option (or -i) may be specified multiple times, its syntax
@@ -3691,14 +3719,6 @@ Optionally specifies the port number for the server to listen on for
 SSL connections (default: whatever --port uses).  See B<--ssl> for
 more details.
 
-=item B<--ssl-version>=I<sslversion>
-
-Specify the SSL protocol version to use, one of B<sslv3> or B<tlsv1>.
-The default, B<sslv3>, is the most flexible, accepting a SSLv3 or
-higher hello handshake, then negotiating use of SSLv3 or TLSv1
-protocol if the client can accept it.  Specifying B<--ssl-version>
-implies B<--ssl>.
-
 =item B<--server-key> I<keyfile>
 
 Specify the SSL key file to use for SSL connections.
@@ -3744,6 +3764,12 @@ C<--socketowner> for notes on ownership and permissions.
 Set UNIX domain socket to use the octal mode I<mode>.  Note that if C<-u> is
 used, that user should have write permissions to unlink the file later, for
 when the C<spamd> server is killed.
+
+
+=item B<--timing>
+
+  Enable timing measurements and output the information for logging.  This
+  is the same information as provided by the TIMING tag.
 
 =back
 

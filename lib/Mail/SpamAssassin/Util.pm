@@ -42,10 +42,13 @@ package Mail::SpamAssassin::Util;
 
 use strict;
 use warnings;
-use bytes;
+# use bytes;
 use re 'taint';
 
+require 5.008001;  # needs utf8::is_utf8()
+
 use Mail::SpamAssassin::Logger;
+use Mail::SpamAssassin::Util::RegistrarBoundaries;  # deprecated
 
 BEGIN {
   use Exporter ();
@@ -57,14 +60,16 @@ BEGIN {
 
   @ISA = qw(Exporter);
   @EXPORT = ();
-  @EXPORT_OK = qw(&local_tz &base64_decode &untaint_var &untaint_file_path
+  @EXPORT_OK = qw(&local_tz &base64_decode &base64_encode
+                  &untaint_var &untaint_file_path
                   &exit_status_str &proc_status_ok &am_running_on_windows
                   &reverse_ip_address &decode_dns_question_entry
-                  &secure_tmpfile &secure_tmpdir &uri_list_canonicalize);
+                  &secure_tmpfile &secure_tmpdir &uri_list_canonicalize
+                  &get_my_locales &parse_rfc822_date &idn_to_ascii
+                  &is_valid_utf_8);
 }
 
 use Mail::SpamAssassin;
-use Mail::SpamAssassin::Util::RegistrarBoundaries;
 
 use Config;
 use IO::Handle;
@@ -73,6 +78,7 @@ use File::Basename;
 use Time::Local;
 use Sys::Hostname (); # don't import hostname() into this namespace!
 use NetAddr::IP 4.000;
+use Scalar::Util qw(tainted);
 use Fcntl;
 use Errno qw(ENOENT EACCES EEXIST);
 use POSIX qw(:sys_wait_h WIFEXITED WIFSIGNALED WIFSTOPPED WEXITSTATUS
@@ -83,15 +89,52 @@ use POSIX qw(:sys_wait_h WIFEXITED WIFSIGNALED WIFSTOPPED WEXITSTATUS
 use constant HAS_MIME_BASE64 => eval { require MIME::Base64; };
 use constant RUNNING_ON_WINDOWS => ($^O =~ /^(?:mswin|dos|os2)/oi);
 
-# These are not implemented on windows (see bug 6798 and 6470)
+# These are only defined as stubs on Windows (see bugs 6798 and 6470).
 BEGIN {
   if (RUNNING_ON_WINDOWS) {
+    no warnings 'redefine';
+
+    # See the section on $? at
+    # http://perldoc.perl.org/perlvar.html#Error-Variables for some
+    # hints on the magic numbers that are used here.
     *WIFEXITED   = sub { not $_[0] & 127 };
     *WEXITSTATUS = sub { $_[0] >> 8 };
-    *WIFSIGNALED = sub { ($_[0] & 127) && ($_[0] & 127 != 127) };
+    *WIFSIGNALED = sub { ($_[0] & 127) && (($_[0] & 127) != 127) };
     *WTERMSIG    = sub { $_[0] & 127 };
   }
 }
+
+###########################################################################
+
+our $ALT_FULLSTOP_UTF8_RE;
+BEGIN {
+  # Bug 6751:
+  # RFC 3490 (IDNA): Whenever dots are used as label separators, the
+  #   following characters MUST be recognized as dots: U+002E (full stop),
+  #   U+3002 (ideographic full stop), U+FF0E (fullwidth full stop),
+  #   U+FF61 (halfwidth ideographic full stop).
+  # RFC 5895: [...] the IDEOGRAPHIC FULL STOP character (U+3002)
+  #   can be mapped to the FULL STOP before label separation occurs.
+  #   [...] Only the IDEOGRAPHIC FULL STOP character (U+3002) is added in
+  #   this mapping because the authors have not fully investigated [...]
+  # Adding also 'SMALL FULL STOP' (U+FE52) as seen in the wild,
+  # and a 'ONE DOT LEADER' (U+2024).
+  #
+  no bytes;  # make sure there is no 'use bytes' in effect
+  my $dot_chars = "\x{2024}\x{3002}\x{FF0E}\x{FF61}\x{FE52}";  # \x{002E}
+  my $dot_bytes = join('|', split(//,$dot_chars));  utf8::encode($dot_bytes);
+  $ALT_FULLSTOP_UTF8_RE = qr/$dot_bytes/so;
+}
+
+###########################################################################
+
+our $have_libidn;
+BEGIN {
+  eval { require Net::LibIDN } and do { $have_libidn = 1 };
+}
+
+$have_libidn or warn "INFO: module Net::LibIDN not available,\n".
+  "  internationalized domain names with U-labels will not be recognized!\n";
 
 ###########################################################################
 
@@ -236,13 +279,15 @@ sub untaint_file_path {
   return '' if ($path eq '');
 
   local ($1);
-  # Barry Jaspan: allow ~ and spaces, good for Windows.  Also return ''
-  # if input is '', as it is a safe path.
-  my $chars = '-_A-Za-z\xA0-\xFF0-9\.\%\@\=\+\,\/\\\:';
-  my $re = qr/^\s*([$chars][${chars}~ ]*)$/o;
+  # Barry Jaspan: allow ~ and spaces, good for Windows.
+  # Also return '' if input is '', as it is a safe path.
+  # Bug 7264: allow also parenthesis, e.g. "C:\Program Files (x86)"
+  my $chars = '-_A-Za-z0-9.%=+,/:()\\@\\xA0-\\xFF\\\\';
+  my $re = qr{^\s*([$chars][${chars}~ ]*)\z}o;
 
   if ($path =~ $re) {
-    return untaint_var($1);
+    $path = $1;
+    return untaint_var($path);
   } else {
     warn "util: refusing to untaint suspicious path: \"$path\"\n";
     return $path;
@@ -284,7 +329,7 @@ sub untaint_var {
 # my $arg = $_[0];  # avoid copying unnecessarily
   if (!ref $_[0]) { # optimized by-far-the-most-common case
     no re 'taint';  # override a  "use re 'taint'"  from outer scope
-    return undef if !defined $_[0];
+    return undef if !defined $_[0]; ## no critic (ProhibitExplicitReturnUndef)  - See Bug 7120
     local($1); # avoid Perl taint bug: tainted global $1 propagates taintedness
     $_[0] =~ /^(.*)\z/s;
     return $1;
@@ -332,6 +377,95 @@ sub taint_var {
   # $^X is apparently "always tainted".
   # Concatenating an empty tainted string taints the result.
   return $v . substr($^X, 0, 0);
+}
+
+###########################################################################
+
+# returns true if the provided string of octets represents a syntactically
+# valid UTF-8 string, otherwise a false is returned
+#
+sub is_valid_utf_8($) {
+# my $octets = $_[0];
+  return undef if !defined $_[0];
+  #
+  # RFC 6532: UTF8-non-ascii = UTF8-2 / UTF8-3 / UTF8-4
+  # RFC 3629 section 4: Syntax of UTF-8 Byte Sequences
+  #   UTF8-char   = UTF8-1 / UTF8-2 / UTF8-3 / UTF8-4
+  #   UTF8-1      = %x00-7F
+  #   UTF8-2      = %xC2-DF UTF8-tail
+  #   UTF8-3      = %xE0 %xA0-BF UTF8-tail /
+  #                 %xE1-EC 2( UTF8-tail ) /
+  #                 %xED %x80-9F UTF8-tail /
+  #                   # U+D800..U+DFFF are utf16 surrogates, not legal utf8
+  #                 %xEE-EF 2( UTF8-tail )
+  #   UTF8-4      = %xF0 %x90-BF 2( UTF8-tail ) /
+  #                 %xF1-F3 3( UTF8-tail ) /
+  #                 %xF4 %x80-8F 2( UTF8-tail )
+  #   UTF8-tail   = %x80-BF
+  #
+  # loose variant:
+  #   [\x00-\x7F] | [\xC0-\xDF][\x80-\xBF] |
+  #   [\xE0-\xEF][\x80-\xBF]{2} | [\xF0-\xF4][\x80-\xBF]{3}
+  #
+  $_[0] =~ /^ (?: [\x00-\x7F] |
+                  [\xC2-\xDF] [\x80-\xBF] |
+                  \xE0 [\xA0-\xBF] [\x80-\xBF] |
+                  [\xE1-\xEC] [\x80-\xBF]{2} |
+                  \xED [\x80-\x9F] [\x80-\xBF] |
+                  [\xEE-\xEF] [\x80-\xBF]{2} |
+                  \xF0 [\x90-\xBF] [\x80-\xBF]{2} |
+                  [\xF1-\xF3] [\x80-\xBF]{3} |
+                  \xF4 [\x80-\x8F] [\x80-\xBF]{2} )* \z/xs ? 1 : 0;
+}
+
+# Given an international domain name with U-labels (UTF-8 or Unicode chars)
+# converts it to ASCII-compatible encoding (ACE).  If the argument is in
+# ASCII (or is an invalid IDN), returns it lowercased but otherwise unchanged.
+# The result is always in octets (utf8 flag off) even if the argument was in
+# Unicode characters.
+#
+sub idn_to_ascii($) {
+  no bytes;  # make sure there is no 'use bytes' in effect
+  return undef  if !defined $_[0];
+  my $s = "$_[0]";  # stringify
+  # propagate taintedness of the argument, but not its utf8 flag
+  my $t = tainted($s);  # taintedness of the argument
+  if ($t) {  # untaint $s, avoids taint-related bugs in LibIDN or in old perl
+    no re 'taint';  local $1;  $s =~ /^(.*)\z/s;
+  }
+  # encode chars to UTF-8, leave octets unchanged (not necessarily valid UTF-8)
+  utf8::encode($s)  if utf8::is_utf8($s);
+  if ($s !~ tr/\x00-\x7F//c) {  # is all-ASCII (including IP address literal)
+    $s = lc $s;
+  } elsif (!is_valid_utf_8($s)) {
+    my($package, $filename, $line) = caller;
+    info("util: idn_to_ascii: not valid UTF-8: /%s/, called from %s line %d",
+         $s, $package, $line);
+    $s = lc $s;  # garbage-in / garbage-out
+  } else {  # is valid UTF-8 but not all-ASCII
+    my $chars;
+    # RFC 3490 (IDNA): Whenever dots are used as label separators, the
+    # following characters MUST be recognized as dots: U+002E (full stop),
+    # U+3002 (ideographic full stop), U+FF0E (fullwidth full stop),
+    # U+FF61 (halfwidth ideographic full stop).
+    if ($s =~ s/$ALT_FULLSTOP_UTF8_RE/./gso) {
+      info("util: idn_to_ascii: alternative dots normalized: /%s/ -> /%s/",
+           $_[0], $s);
+    }
+    if (!$have_libidn) {
+      $s = lc $s;
+    } else {
+      # to ASCII-compatible encoding (ACE), lowercased
+      my $sa = Net::LibIDN::idn_to_ascii($s, 'UTF-8');
+      if (!defined $sa) {
+        info("util: idn_to_ascii: conversion to ACE failed: /%s/", $s);
+      } else {
+        info("util: idn_to_ascii: converted to ACE: /%s/ -> /%s/", $s, $sa);
+        $s = $sa;
+      }
+    }
+  }
+  $t ? taint_var($s) : $s;  # propagate taintedness of the argument
 }
 
 ###########################################################################
@@ -689,6 +823,7 @@ sub base64_decode {
       m|^(?:[A-Za-z0-9+/=]{2,}={0,2})$|s)
   {
     # only use MIME::Base64 when the XS and Perl are both correct and quiet
+    local $1;
     s/(=+)(?!=*$)/'A' x length($1)/ge;
 
     # If only a certain number of bytes are requested, truncate the encoded
@@ -704,7 +839,7 @@ sub base64_decode {
   }
   tr{A-Za-z0-9+/=}{}cd;			# remove non-base64 characters
   s/=+$//;				# remove terminating padding
-  tr{A-Za-z0-9+/=}{ -_`};		# translate to uuencode
+  tr{A-Za-z0-9+/=}{ -_};		# translate to uuencode
   s/.$// if (length($_) % 4 == 1);	# unpack cannot cope with extra byte
 
   my $length;
@@ -725,18 +860,28 @@ sub base64_decode {
 }
 
 sub qp_decode {
-  local $_ = shift;
+  my $str = $_[0];
 
-  s/\=\r?\n//gs;
-  s/\=([0-9a-fA-F]{2})/chr(hex($1))/ge;
-  return $_;
+  # RFC 2045: when decoding a Quoted-Printable body, any trailing
+  # white space on a line must be deleted
+  $str =~ s/[ \t]+(?=\r?\n)//gs;
+
+  $str =~ s/=\r?\n//gs;  # soft line breaks
+
+  # RFC 2045 explicitly prohibits lowercase characters a-f in QP encoding
+  # do we really want to allow them???
+
+  local $1;
+  $str =~ s/=([0-9a-fA-F]{2})/chr(hex($1))/ge;
+
+  return $str;
 }
 
 sub base64_encode {
   local $_ = shift;
 
   if (HAS_MIME_BASE64) {
-    return MIME::Base64::encode_base64($_);
+    return MIME::Base64::encode_base64($_,'');
   }
 
   $_ = pack("u57", $_);
@@ -795,10 +940,10 @@ sub extract_ipv4_addr_from_string {
   return unless defined($str);
 
   if ($str =~ /\b(
-			(?:1\d\d|2[0-4]\d|25[0-5]|\d\d|\d)\.
-			(?:1\d\d|2[0-4]\d|25[0-5]|\d\d|\d)\.
-			(?:1\d\d|2[0-4]\d|25[0-5]|\d\d|\d)\.
-			(?:1\d\d|2[0-4]\d|25[0-5]|\d\d|\d)
+			(?:1\d\d|2[0-4]\d|25[0-5]|[1-9]\d|\d)\.
+			(?:1\d\d|2[0-4]\d|25[0-5]|[1-9]\d|\d)\.
+			(?:1\d\d|2[0-4]\d|25[0-5]|[1-9]\d|\d)\.
+			(?:1\d\d|2[0-4]\d|25[0-5]|[1-9]\d|\d)
 		      )\b/ix)
   {
     if (defined $1) { return $1; }
@@ -931,8 +1076,8 @@ sub decode_dns_question_entry {
 
   local $1;
   # Net::DNS provides a query in encoded RFC 1035 zone file format, decode it!
-  $qname =~ s{ \\ ( [0-9]{3} | [^0-9] ) }
-             { length($1)==1 ? $1 : $1 <= 255 ? chr($1) : "\\$1" }xgse;
+  $qname =~ s{ \\ ( [0-9]{3} | (?![0-9]{3}) . ) }
+             { length($1)==3 && $1 <= 255 ? chr($1) : $1 }xgse;
   return ($q->qclass, $q->qtype, $qname);
 }
 
@@ -1001,7 +1146,7 @@ sub parse_content_type {
   }
 
   # strip inappropriate chars (bug 5399: after the text/plain fixup)
-  $ct =~ tr/\000-\040\177-\377\042\050\051\054\056\072-\077\100\133-\135//d;
+  $ct =~ tr/\000-\040\177-\377\042\050\051\054\072-\077\100\133-\135//d;
 
   # Now that the header has been parsed, return the requested information.
   # In scalar context, just the MIME type, in array context the
@@ -1032,6 +1177,7 @@ sub url_encode {
     }
     # other stuff
     else {
+      # no re "strict";  # since perl 5.21.8
       # 0x00-0x20, 0x7f-0xff, ", %, <, >
       s/([\000-\040\177-\377\042\045\074\076])
 	  /push(@encoded, $1) && sprintf "%%%02x", unpack("C",$1)/egx;
@@ -1192,8 +1338,14 @@ sub secure_tmpdir {
 
 ###########################################################################
 
+##
+## DEPRECATED FUNCTION, only left for third party plugins as fallback.
+## Replaced with Mail::SpamAssassin::RegistryBoundaries::uri_to_domain.
+##
 sub uri_to_domain {
   my ($uri) = @_;
+
+  warn "DEPRECATED: MS::Util::uri_to_domain, Bug 7170";
 
   # Javascript is not going to help us, so return.
   return if ($uri =~ /^javascript:/i);
@@ -1256,15 +1408,15 @@ sub uri_list_canonicalize {
     # bug 4390: certain MUAs treat back slashes as front slashes.
     # since backslashes are supposed to be encoded in a URI, swap non-encoded
     # ones with front slashes.
-    $nuri =~ tr@\\@/@;
+    $nuri =~ tr{\\}{/};
 
     # http:www.foo.biz -> http://www.foo.biz
-    $nuri =~ s#^(https?:)/{0,2}#$1//#i;
+    $nuri =~ s{^(https?:)/{0,2}}{$1//}i;
 
     # *always* make a dup with all %-encoding decoded, since
     # important parts of the URL may be encoded (such as the
     # scheme). (bug 4213)
-    if ($nuri =~ /\%[0-9a-fA-F]{2}/) {
+    if ($nuri =~ /%[0-9a-fA-F]{2}/) {
       $nuri = Mail::SpamAssassin::Util::url_encode($nuri);
     }
 
@@ -1272,15 +1424,15 @@ sub uri_list_canonicalize {
     # unschemed URIs: assume default of "http://" as most MUAs do
     if ($nuri !~ /^[-_a-z0-9]+:/i) {
       if ($nuri =~ /^ftp\./) {
-	$nuri =~ s@^@ftp://@g;
+	$nuri =~ s{^}{ftp://}g;
       }
       else {
-	$nuri =~ s@^@http://@g;
+	$nuri =~ s{^}{http://}g;
       }
     }
 
     # http://www.foo.biz?id=3 -> http://www.foo.biz/?id=3
-    $nuri =~ s@^(https?://[^/?]+)\?@$1/?@i;
+    $nuri =~ s{^(https?://[^/?]+)\?}{$1/?}i;
 
     # deal with encoding of chars, this is just the set of printable
     # chars minus ' ' (that is, dec 33-126, hex 21-7e)
@@ -1299,6 +1451,12 @@ sub uri_list_canonicalize {
       # not required
       $rest ||= '';
 
+      my $nhost = idn_to_ascii($host);
+      if (defined $nhost && $nhost ne lc $host) {
+        push(@nuris, join('', $proto, $nhost, $rest));
+        $host = $nhost;
+      }
+
       # bug 4146: deal with non-US ASCII 7-bit chars in the host portion
       # of the URI according to RFC 1738 that's invalid, and the tested
       # browsers (Firefox, IE) remove them before usage...
@@ -1309,23 +1467,27 @@ sub uri_list_canonicalize {
       # deal with http redirectors.  strip off one level of redirector
       # and add back to the array.  the foreach loop will go over those
       # and deal appropriately.
-      # bug 3308: redirectors like yahoo only need one '/' ... <grrr>
-      if ($rest =~ m{(https?:/{0,2}.+)$}i) {
-        push(@uris, $1);
-      }
 
-      # resort to redirector pattern matching if the generic https? check
-      # doesn't result in a match -- bug 4176
-      else {
-	foreach (@{$redirector_patterns}) {
-	  if ("$proto$host$rest" =~ $_) {
-	    next unless defined $1;
-	    dbg("uri: parsed uri pattern: $_");
-	    dbg("uri: parsed uri found: $1 in redirector: $proto$host$rest");
-	    push (@uris, $1);
-	    last;
-	  }
-	}
+      # Bug 7278: try redirector pattern matching first
+      # (but see also Bug 4176)
+      my $found_redirector_match;
+      foreach my $re (@{$redirector_patterns}) {
+        if ("$proto$host$rest" =~ $re) {
+          next unless defined $1;
+          dbg("uri: parsed uri pattern: $re");
+          dbg("uri: parsed uri found: $1 in redirector: $proto$host$rest");
+          push (@uris, $1);
+          $found_redirector_match = 1;
+          last;
+        }
+      }
+      if (!$found_redirector_match) {
+        # try generic https? check if redirector pattern matching failed
+        # bug 3308: redirectors like yahoo only need one '/' ... <grrr>
+        if ($rest =~ m{(https?:/{0,2}.+)$}i) {
+          push(@uris, $1);
+          dbg("uri: parsed uri found: $1 in hard-coded redirector");
+        }
       }
 
       ########################

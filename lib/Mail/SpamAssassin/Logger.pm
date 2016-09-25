@@ -37,7 +37,7 @@ package Mail::SpamAssassin::Logger;
 
 use strict;
 use warnings;
-use bytes;
+# use bytes;
 use re 'taint';
 
 BEGIN {
@@ -322,8 +322,8 @@ sub remove {
 
 =item would_log($level, $facility)
 
-Returns 0 if a message at the given level and with the given facility
-would be logged.  Returns 1 if a message at a given level and facility
+Returns false if a message at the given level and with the given facility
+would not be logged.  Returns 1 if a message at a given level and facility
 would be logged normally.  Returns 2 if the facility was specifically
 enabled.
 

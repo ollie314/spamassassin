@@ -518,6 +518,7 @@ foreach my $channel (@channels) {
 
     if ( defined $opt{'checkonly'} ) {            
       dbg("channel: $channel: --install and --checkonly, claiming update available");
+      $channel_successes++;
       next;
     }
 
@@ -558,6 +559,7 @@ foreach my $channel (@channels) {
     if ( defined $opt{'checkonly'} ) {            
       dbg("channel: $channel: update available, not downloading ".
           "in checkonly mode");
+      $channel_successes++;
       next;
     }
 
@@ -738,6 +740,16 @@ foreach my $channel (@channels) {
       my $mirror_info = $mirrors{$mirror};
       delete $mirrors{$mirror};
 
+      if (!check_mirror_af($mirror)) {
+        my @my_af;
+        push(@my_af, "IPv4") if $have_inet4;
+        push(@my_af, "IPv6") if $have_inet6;
+        push(@my_af, "no IP service") if !@my_af;
+        dbg("reject mirror %s: no common address family (%s)",
+            $mirror, join(" ", @my_af));
+        next;
+      }
+
       dbg("channel: selected mirror $mirror");
 
       # Actual archive file
@@ -854,7 +866,7 @@ foreach my $channel (@channels) {
       }
 
       # use the longest match we can find
-      $signer = $key if (length $key > length $signer);
+      $signer = $key if length $key > length $signer;
     }
 
     my $errno = 0;  close CMD or $errno = $!;
@@ -1470,10 +1482,10 @@ sub http_get {
                    --fail -o), $out_fname_short);
     push(@args, '-z', $out_fname_short)  if $out_fname_exists && !$force_reload;
   } elsif (defined $ext_prog && $ext_prog eq 'wget') {
-    push(@args, qw(-q -N --max-redirect=2 --tries=3
-                   --dns-timeout=20 --connect-timeout=30 --read-timeout=300
-                   -O), $out_fname_short);
-    #*** ???  if $out_fname_exists && !$force_reload;
+    push(@args, qw(-q --max-redirect=2 --tries=3
+                   --dns-timeout=20 --connect-timeout=30 --read-timeout=300));
+    push(@args, defined $suggested_out_fname ? ('-O', $out_fname_short)
+                : $force_reload ? () : ('-N') );
   } elsif (defined $ext_prog && $ext_prog eq 'fetch') {
     push(@args, qw(-q -n -a -w 20 -m -o), $out_fname_short);
     push(@args, '-m')  if $out_fname_exists && !$force_reload;
@@ -1592,9 +1604,21 @@ sub choose_mirror {
 
 ##############################################################################
 
+sub check_mirror_af {
+    my ($mirror) = @_;
+    my($a_rr, $aaaa_rr);
+      # RFC 3986:  scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+    $mirror =~ s{^[a-z][a-z0-9.+-]*://}{}si;  # strip scheme like http://
+    return 1 if $have_inet4 && do_dns_query($mirror, "A");
+    return 1 if $have_inet6 && do_dns_query($mirror, "AAAA");
+    return 0;
+}
+
+##############################################################################
+
 sub print_version {
-  print "sa-update version $VERSION\n"
-      . "  running on Perl version " . join(".", map { $_||=0; $_*1 } ($] =~ /(\d)\.(\d{3})(\d{3})?/ )) . "\n";
+  printf("sa-update version %s\n  running on Perl version %s\n", $VERSION, 
+         join(".", map( 0+($_||0), ( $] =~ /(\d)\.(\d{3})(\d{3})?/ ))));
 }
 
 ##############################################################################
@@ -1995,8 +2019,10 @@ Print sa-update version and exit.
 
 =head1 EXIT CODES
 
-An exit code of C<0> means an update was available, and was downloaded and
-installed successfully if --checkonly was not specified.
+In absence of a --checkonly option, an exit code of C<0> means:
+an update was available, and was downloaded and installed successfully.
+If --checkonly was specified, an exit code of C<0> means: an update was
+available.
 
 An exit code of C<1> means no fresh updates were available.
 
@@ -2030,10 +2056,13 @@ See <http://issues.apache.org/SpamAssassin/>
 
 The Apache SpamAssassin(tm) Project <http://spamassassin.apache.org/>
 
-=head1 COPYRIGHT
+=head1 LICENSE AND COPYRIGHT
 
 SpamAssassin is distributed under the Apache License, Version 2.0, as
 described in the file C<LICENSE> included with the distribution.
+
+Copyright (C) 2015 The Apache Software Foundation
+
 
 =cut
 

@@ -7,13 +7,8 @@ use Config;
 
 use ExtUtils::MakeMaker;
 
-# Store the version for later use
-my $mm_version = $ExtUtils::MakeMaker::VERSION;
-
 # avoid stupid 'Argument "6.30_01" isn't numeric in numeric ge (>=)' warnings;
-# strip off the beta subversion noise that causes the trouble.
-$mm_version =~ s/_\S+$//;      # "6.30_01" => "6.30"
-$mm_version += 0;
+my $mm_version = eval $ExtUtils::MakeMaker::VERSION;
 
 if ($mm_version < 6.17) {
   die "SpamAssassin Makefile.PL requires at least ExtUtils::MakeMaker v6.17";
@@ -77,6 +72,7 @@ my @ATT_KEYS = (
 
 
   'BUILD_SPAMC'  ,    # Set to 'no' to skip build of spamc.
+  'BUILD_SPAMD',      # Set to 'no' to skip build of spamd.
   'ENABLE_SSL',       # Set to 'yes' to build spamc with SSL support.
   'CONTACT_ADDRESS',  # To not ask for the contact address, use this.
 );
@@ -110,6 +106,7 @@ sub yesno {
 
 my %opt = (
   'build_spamc'     => undef,
+  'build_spamd'     => undef,
   'enable_ssl'      => undef,
   'contact_address' => undef,
   'destdir'         => undef,
@@ -272,9 +269,19 @@ unless($Config{installman1dir}
 
 # Windows platforms need some adjustments
 if (RUNNING_ON_WINDOWS) {
-  # Don't build spamd
-  delete $makefile{EXE_FILES}{'spamd/spamd.raw'};
-  delete $makefile{MAN1PODS}{'spamd/spamd'};
+  # Building spamd is optional on Windows because it still is somewhat
+  # experimental.
+  if (!defined $opt{'build_spamd'}) {
+    $opt{'build_spamd'} = bool(prompt(
+      "Build spamd.exe (experimental on windows platforms)? (y/n)",
+      'n'));
+  } else {
+    $opt{'build_spamd'} = bool($opt{'build_spamd'});
+  }
+  if (!$opt{'build_spamd'}) {
+    delete $makefile{EXE_FILES}{'spamd/spamd.raw'};
+    delete $makefile{MAN1PODS}{'spamd/spamd'};
+  }
   # building spamc is optional under Win32 because not everyone has compiler
   if (!defined $opt{'build_spamc'}) {
     $opt{'build_spamc'} = bool(prompt(
@@ -1062,7 +1069,7 @@ spamc_has_moved:
 	$(NOECHO) echo "*** spamc now has its own directory: $(TARGET) is $(SOURCE)"
 	$(NOECHO) echo "***"
 	$(PERL) -MFile::Spec -MFile::Copy \
-	  -e "copy(q{$(SOURCE)}, q{$(TARGET)});"
+	  -e "copy(q[$(SOURCE)], q{$(TARGET)});"
 
 spamc/libspamc.so: $(SPAMC_MAKEFILE) $(LIBSPAMC_SRC)
 	$(MAKE_SPAMC) $@
@@ -1098,14 +1105,14 @@ qmail/qmail-spamc$(EXE_EXT): spamc/qmail-spamc$(EXE_EXT)
 
 conf__install:
 	-$(MKPATH) $(B_CONFDIR)
-	$(PERL) -MFile::Copy -e "copy(q{rules/local.cf}, q{$(B_CONFDIR)/local.cf}) unless -f q{$(B_CONFDIR)/local.cf}"
-	$(PERL) -MFile::Copy -e "copy(q{rules/init.pre}, q{$(B_CONFDIR)/init.pre}) unless -f q{$(B_CONFDIR)/init.pre}"
-	$(PERL) -MFile::Copy -e "copy(q{rules/v310.pre}, q{$(B_CONFDIR)/v310.pre}) unless -f q{$(B_CONFDIR)/v310.pre}"
-	$(PERL) -MFile::Copy -e "copy(q{rules/v312.pre}, q{$(B_CONFDIR)/v312.pre}) unless -f q{$(B_CONFDIR)/v312.pre}"
-	$(PERL) -MFile::Copy -e "copy(q{rules/v320.pre}, q{$(B_CONFDIR)/v320.pre}) unless -f q{$(B_CONFDIR)/v320.pre}"
-	$(PERL) -MFile::Copy -e "copy(q{rules/v330.pre}, q{$(B_CONFDIR)/v330.pre}) unless -f q{$(B_CONFDIR)/v330.pre}"
-	$(PERL) -MFile::Copy -e "copy(q{rules/v340.pre}, q{$(B_CONFDIR)/v340.pre}) unless -f q{$(B_CONFDIR)/v340.pre}"
-	$(PERL) -MFile::Copy -e "copy(q{rules/v341.pre}, q{$(B_CONFDIR)/v341.pre}) unless -f q{$(B_CONFDIR)/v341.pre}"
+	$(PERL) -MFile::Copy -e "copy(q[rules/local.cf], q{$(B_CONFDIR)/local.cf}) unless -f q{$(B_CONFDIR)/local.cf}"
+	$(PERL) -MFile::Copy -e "copy(q[rules/init.pre], q{$(B_CONFDIR)/init.pre}) unless -f q{$(B_CONFDIR)/init.pre}"
+	$(PERL) -MFile::Copy -e "copy(q[rules/v310.pre], q{$(B_CONFDIR)/v310.pre}) unless -f q{$(B_CONFDIR)/v310.pre}"
+	$(PERL) -MFile::Copy -e "copy(q[rules/v312.pre], q{$(B_CONFDIR)/v312.pre}) unless -f q{$(B_CONFDIR)/v312.pre}"
+	$(PERL) -MFile::Copy -e "copy(q[rules/v320.pre], q{$(B_CONFDIR)/v320.pre}) unless -f q{$(B_CONFDIR)/v320.pre}"
+	$(PERL) -MFile::Copy -e "copy(q[rules/v330.pre], q{$(B_CONFDIR)/v330.pre}) unless -f q{$(B_CONFDIR)/v330.pre}"
+	$(PERL) -MFile::Copy -e "copy(q[rules/v340.pre], q{$(B_CONFDIR)/v340.pre}) unless -f q{$(B_CONFDIR)/v340.pre}"
+	$(PERL) -MFile::Copy -e "copy(q[rules/v341.pre], q{$(B_CONFDIR)/v341.pre}) unless -f q{$(B_CONFDIR)/v341.pre}"
   
 
 data__install:

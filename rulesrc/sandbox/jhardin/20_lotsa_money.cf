@@ -5,7 +5,7 @@
 #
 
 ifplugin Mail::SpamAssassin::Plugin::ReplaceTags
-  replace_tag  CURRENCY   [\(\[]?(?:\bU[Ss][D\$]{0,2}|\$(?:US)?|usd|GBP|=[Aa][34]|\xa3|&\#16[34];|(?i:pounds\ssterling)|\xa4|EUR(?:OS)?|(?:d')?[Ee]uro?s?|(?i:eur)\sde|CHF|FCFA|d[\xf3]lares\sde\slos\sE+\.\s?U+\.)[\]\)]?
+  replace_tag  CURRENCY   [\(\[]?(?:\bU[Ss][D\$]{0,2}|\$(?:US)?|usd|CAD|GBP|=[Aa][34]|\xa3|&\#16[34];|(?i:pounds\ssterling)|\xa4|EUR(?:OS)?|(?:d')?[Ee]uro?s?|(?i:eur)\sde|CHF|FCFA|d[\xf3]lares\sde\slos\sE+\.\s?U+\.)[\]\)]?
   replace_tag  GB_UK      \b(?:U\.?K\.?|(?:Great\s)?Brit(?:ain|ish)|G\.?B\.?)\b
 
   body     __LOTSA_MONEY_00   /<CURRENCY>[\s\.]?[1-9][\dOo][,\.][\dOo]{3}(?:(?!\d)|\b)/
@@ -87,12 +87,12 @@ body     __TO_YOUR_ORG       /\b(?:to|for) your organi[sz]ation\b/i
 body     __TRAVEL_ITINERARY  /(?:travel|ticketed|your|current) itinerary/i
 body     __AUTO_ACCIDENT     /auto(?:mobile)? accident/i
 
-body     __LOTTO_AGENT_01 /\b(?:(?:(?:the|y?our)(?:\s\w{1,20})?|contact|accredited|listed)\sclaim(?:s|ing)?(?:\sprocessing)?|fiducia\w+|reimbursement|(?:prize|international|intl|foreign|win+ing)(?:[\s,.]+(?:rem+it+ance|settlement|payment|payout|award|transfer))+|payment|payout|immunity|(?<!memory\s)grants?)\s?(?:agent|manager|officer|secretary|director|mgr\b)/i
+body     __LOTTO_AGENT_01 /\b(?:(?:(?:the|y?our)(?:\s\w{1,20})?|contact|accredited|listed)\sclaim(?:s|ing)?(?:\sprocessing)?|fiducia\w+|reimbursement|(?:prize|international|intl|foreign|win+ing)(?:[\s,.]+(?:rem+it+ance|settlement|payment|payout|award|transfer))+|payment|payout|immunity|(?<!memory\s)grants?(?!\smanager))\s?(?:agent|manager|officer|secretary|director|mgr\b)/i
 body     __LOTTO_AGENT_02 /\blot+ery[^\.]{1,40} ticket agent/i
 meta     __LOTTO_AGENT    __LOTTO_AGENT_01 || __LOTTO_AGENT_02
-meta     LOTTO_AGENT      __LOTTO_AGENT && !__HAS_IN_REPLY_TO && !__THREADED && !__TO_YOUR_ORG && !__DKIM_EXISTS && !__TRAVEL_ITINERARY && !__AUTO_ACCIDENT
+meta     LOTTO_AGENT      __LOTTO_AGENT && !__HAS_IN_REPLY_TO && !__THREADED && !__TO_YOUR_ORG && !__DKIM_EXISTS && !__TRAVEL_ITINERARY && !__AUTO_ACCIDENT && !__HAS_ERRORS_TO && !__RP_MATCHES_RCVD 
 describe LOTTO_AGENT      Claims Agent
-score    LOTTO_AGENT      2.50		# limit
+score    LOTTO_AGENT      1.50		# limit
 
 body     __LOTTO_DEPT       /\b(?:claim(?:s|ing)?(?:\sprocessing)?|fiducia\w+|reimbursement|(?:international|foreign|win+ing)(?:\s(?:rem+it+ance|settlement|payment|award))+|payment|award|compensation|lot+ery)(?:\s\w+)?\s?(?:department|dept|unit|group|committee|bureau)/i
 meta     LOTTO_DEPT       __LOTTO_DEPT && !__COMMENT_EXISTS && !__HAS_IN_REPLY_TO && !__THREADED && !__VIA_ML && !__TO_YOUR_ORG && !__TRAVEL_ITINERARY && !__AUTO_ACCIDENT
@@ -161,8 +161,8 @@ body     __FIFTY_FIFTY    /\b(?:50|fifty)(?:%?[\/:]50%?|%|\spercent)/i
 meta     SHARE_50_50     (__SHARE_IT || __AGREED_RATIO) && __FIFTY_FIFTY
 describe SHARE_50_50     Share the money 50/50
 
-body     EMRCP            /\bExcess Maximum Return Capital Profit\b/i
-describe EMRCP            "Excess Maximum Return Capital Profit" Fidelity scam
+body     EMRCP            /\bExcess (?:Maximum )?Return Capital (?:Profits?|Funds?)\b/i
+describe EMRCP            "Excess Maximum Return Capital Profit" scam
 
 meta     LUCRATIVE        __LUCRATIVE && !ALL_TRUSTED && !__ANY_TEXT_ATTACH && !__REPLYTO_EXISTS && !__LCL__ENV_AND_HDR_FROM_MATCH 
 describe LUCRATIVE        Make lots of money!
@@ -195,7 +195,7 @@ endif
 #describe MONEY_DEAL       Lots of money in a suspicious deal
 #score    MONEY_DEAL       1.5
 
-body     __ATM_CARD       /\b(?:your|the|this|through|via|by\smeans\sof\|that\sa)[\s\(](?:\w{1,20}\s)?(?:atm|debit|(?:money[\s-]?gram\s)?fast\scash)(?:\smaster|swift|value?|cash)?[\s\)]card/i
+body     __ATM_CARD       /\b(?:your|the|this|through|via|by\smeans\sof\|that\sa|issue\s(?:(?:to|for)\s)?you\sa)[\s\(](?:\w{1,20}\s)?(?:atm|debit|(?:money[\s-]?gram\s)?fast\scash)(?:\smaster|swift|value?|cash)?[\s\)]card/i
 meta     __MONEY_ATM_CARD LOTS_OF_MONEY && __ATM_CARD
 meta     MONEY_ATM_CARD   __MONEY_ATM_CARD && !__COMMENT_EXISTS && !__TAG_EXISTS_STYLE
 describe MONEY_ATM_CARD   Lots of money on an ATM card

@@ -15,11 +15,38 @@
 # limitations under the License.
 # </@LICENSE>
 
+=head1 NAME
+
+MIMEEval - perform various tests against MIME structure and body
+
+=head1 SYNOPSIS
+
+  loadplugin    Mail::SpamAssassin::Plugin::MIMEEval
+
+  body NAME_OF_RULE  eval:check_for_mime
+  body NAME_OF_RULE  eval:check_for_mime_html
+  body NAME_OF_RULE  eval:check_for_mime_html_only
+  body NAME_OF_RULE  eval:check_mime_multipart_ratio
+  body NAME_OF_RULE  eval:check_msg_parse_flags
+  body NAME_OF_RULE  eval:check_for_ascii_text_illegal
+  body NAME_OF_RULE  eval:check_abundant_unicode_ratio
+  body NAME_OF_RULE  eval:check_for_faraway_charset
+  body NAME_OF_RULE  eval:check_for_uppercase
+  body NAME_OF_RULE  eval:check_ma_non_text
+  body NAME_OF_RULE  eval:check_base64_length
+  body NAME_OF_RULE  eval:check_qp_ratio
+
+=head1 DESCRIPTION
+
+Perform various tests against MIME structure and body.
+
+=cut
+
 package Mail::SpamAssassin::Plugin::MIMEEval;
 
 use strict;
 use warnings;
-use bytes;
+# use bytes;
 use re 'taint';
 
 use Mail::SpamAssassin::Plugin;
@@ -70,9 +97,11 @@ sub are_more_high_bits_set {
   ($numlos <= $numhis && $numhis > 3);
 }
 
+=over 4
+
 =item has_check_for_ascii_text_illegal
 
-Adds capability check for "if can()" for has_check_for_ascii_text_illegal
+Adds capability check for "if can()" for check_for_ascii_text_illegal
 
 =cut
 
@@ -103,7 +132,7 @@ sub has_check_abundant_unicode_ratio { 1 }
 
 =item check_abundant_unicode_ratio
 
-A MIME part claiming to be text/plain and containing Unicode characters must be encoded as quoted-printable or base64.  Any message in 7bit or 8bit encoding containing (HTML) Unicode entities will not render them as Unicode, but literally.
+A MIME part claiming to be text/plain and containing Unicode characters must be encoded as quoted-printable or base64, or use UTF data coding (typically with 8bit encoding).  Any message in 7bit or 8bit encoding containing (HTML) Unicode entities will not render them as Unicode, but literally.
 
 Thus a few such sequences might occur on a mailing list of developers discussing such characters, but a message with a high density of such characters is likely spam.
 
@@ -399,10 +428,11 @@ sub _check_attachments {
       # except NUL or a free-standing CR. anything else is a violation of
       # the definition of charset="us-ascii".
       if ($ctype eq 'text/plain' && (!defined $charset || $charset eq 'us-ascii')) {
+        # no re "strict";  # since perl 5.21.8: Ranges of ASCII printables...
         if (m/[\x00\x0d\x80-\xff]+/) {
           if (would_log('dbg', 'eval')) {
             my $str = $_;
-            $str =~ s/[\x00\x0d\x80-\xff]+/'<' . unpack('H*', $&) . '>'/eg;
+            $str =~ s/([\x00\x0d\x80-\xff]+)/'<' . unpack('H*', $1) . '>'/eg;
             dbg("check: ascii_text_illegal: matches " . $str . "\n");
           }
           $pms->{mime_ascii_text_illegal}++;
@@ -410,8 +440,7 @@ sub _check_attachments {
       }
 
       # if we're text/plain, we should never see unicode escapes in this
-      # format, especially not for 7bit or 8bit. unicode requires base64
-      # or quoted-printable encoding.
+      # format, especially not for 7bit or 8bit.
       if ($ctype eq 'text/plain' && ($cte eq '' || $cte eq '7bit' || $cte eq '8bit')) {
         my ($text, $subs) = $_;
 
@@ -473,6 +502,7 @@ sub _check_attachments {
 Adds capability check for "if can()" for check_qp_ratio
 
 =cut
+
 sub has_check_qp_ratio { 1 }
 
 =item check_qp_ratio
@@ -480,7 +510,10 @@ sub has_check_qp_ratio { 1 }
 Takes a min ratio to use in eval to see if there is an spamminess to the ratio of 
 quoted printable to total bytes in an email.
 
+=back
+
 =cut
+
 sub check_qp_ratio {
   my ($self, $pms, undef, $min) = @_;
 

@@ -108,8 +108,15 @@ use Socket;
 
 use strict;
 use warnings;
-use bytes;
+# use bytes;
 use re 'taint';
+use version;
+
+# need GeoIP C library 1.6.3 and GeoIP perl API 1.4.4 or later to avoid messages leaking - Bug 7153
+my $gic_wanted = version->parse('v1.6.3');
+my $gic_have = version->parse(Geo::IP->lib_version());
+my $gip_wanted = version->parse('v1.4.4');
+my $gip_have = version->parse($Geo::IP::VERSION);
 
 use vars qw(@ISA);
 @ISA = qw(Mail::SpamAssassin::Plugin);
@@ -131,11 +138,9 @@ sub new {
 
   # this code burps an ugly message if it fails, but that's redirected elsewhere
   my $flags = 0;
-  eval '$flags = Geo::IP::GEOIP_SILENCE if (defined &Geo::IP::GEOIP_SILENCE)';
-  open(STDERR, ">&OLDERR");
-  close(OLDERR);
+  eval '$flags = Geo::IP::GEOIP_SILENCE' if ($gip_wanted >= $gip_have);
 
-  if ($flags) {
+  if ($flags && $gic_wanted >= $gic_have) {
     $self->{geoip} = Geo::IP->new(GEOIP_MEMORY_CACHE | GEOIP_CHECK_CACHE | $flags);
     $self->{geoisp} = Geo::IP->open_type(GEOIP_ISP_EDITION, GEOIP_MEMORY_CACHE | GEOIP_CHECK_CACHE | $flags);
   } else {
@@ -345,7 +350,7 @@ sub check_uri_local_bl {
     # look for W3 links only
     next unless (defined $info->{types}->{a});
 
-    while (my($host, $domain) = each $info->{hosts}) {
+    while (my($host, $domain) = each %{$info->{hosts}}) {
 
       # skip if the domain name was matched
       if (exists $rule->{exclusions} && exists $rule->{exclusions}->{$domain}) {
@@ -369,7 +374,7 @@ sub check_uri_local_bl {
         }
 
         if (exists $rule->{countries}) {
-          dbg("check: uri_local_bl countries %s\n", join(' ', sort keys $rule->{countries}));
+          dbg("check: uri_local_bl countries %s\n", join(' ', sort keys %{$rule->{countries}}));
 
           my $cc = $self->{geoip}->country_code_by_addr($ip);
 
@@ -398,7 +403,7 @@ sub check_uri_local_bl {
         }
 
         if (exists $rule->{isps}) {
-          dbg("check: uri_local_bl isps %s\n", join(' ', map { '"' . $_ . '"'; } sort keys $rule->{isps}));
+          dbg("check: uri_local_bl isps %s\n", join(' ', map { '"' . $_ . '"'; } sort keys %{$rule->{isps}}));
 
           my $isp = $self->{geoisp}->isp_by_name($ip);
 

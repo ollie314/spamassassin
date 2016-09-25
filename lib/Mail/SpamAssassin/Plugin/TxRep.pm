@@ -15,6 +15,7 @@
 # limitations under the License.
 # </@LICENSE>
 
+
 =head1 NAME
 
 Mail::SpamAssassin::Plugin::TxRep - Normalize scores with sender reputation records
@@ -23,16 +24,20 @@ Mail::SpamAssassin::Plugin::TxRep - Normalize scores with sender reputation reco
 =head1 SYNOPSIS
 
 The TxRep (Reputation) plugin is designed as an improved replacement of the AWL
-(Auto-Whitelist) plugin. It adjusts the final message spam score by looking up and
-taking in consideration the reputation of the sender.
+(Auto-Whitelist) plugin. It adjusts the final message spam score by looking up 
+and taking in consideration the reputation of the sender.
 
-To try TxRep out, you B<have to> disable the AWL plugin (if present), back up its
-database and add a line loading this module in init.pre (AWL may be enabled in v310.pre):
+To try TxRep out, you B<have to> first disable the AWL plugin (if enabled), and
+back up its database. AWL is loaded in v310.pre and can be disabled by
+commenting out the loadplugin line:
 
  # loadplugin   Mail::SpamAssassin::Plugin::AWL
-   loadplugin   Mail::SpamAssassin::Plugin::TxRep
 
 When AWL is not disabled, TxRep will refuse to run.
+
+TxRep should be enabled by uncommenting the following line in v341.pre:
+
+  loadplugin   Mail::SpamAssassin::Plugin::TxRep
 
 Use the supplied 60_txreputation.cf file or add these lines to a .cf file:
 
@@ -109,13 +114,16 @@ progressively reducing the impact of past records. More details can be found in 
 description of the factor below.
 
 6. B<Blacklisting and Whitelisting> - when a whitelisting or blacklisting was requested
-through SpamAssassin's API, AWL adjusts the historical total score by a fixed value,
-regardless of the number of messages recorded at given sender. It results in practical
-impossibility of blacklisting or whitelisting any sender with higher number of recorded
-scores. Even at senders with few messages, the impact of the whitelisting or blacklisting
-is minimal, and new messages can be still tagged incorrectly. TxRep handles black/whitelisting
-differently, so that it has the desired effect. It is explained in details in the section
-L</BLACKLISTING / WHITELISTING>.
+through SpamAssassin's API, AWL adjusts the historical total score of the plain email
+address without IP (and deleted records bound to an IP), but since during the reception 
+new records with IP will be added, the blacklisted entry would cease acting during 
+scanning. TxRep always uses the record of the plain email address without IP together 
+with the one bound to an IP address, DKIM signature, or SPF pass (unless the weight 
+factor for the EMAIL reputation is set to zero). AWL uses the score of 100 (resp. -100) 
+for the blacklisting (resp. whitelisting) purposes. TxRep increases the value 
+proportionally to the weight factor of the EMAIL reputation. It is explained in details 
+in the section L</BLACKLISTING / WHITELISTING>. TxRep can blacklist or whitelist also
+IP addresses, domain names, and dotless HELO names.
 
 7. B<Sender Identification> - AWL identifies a sender on the basis of the email address
 used, and the originating IP address (better told its part defined by the mask setting).
@@ -193,7 +201,7 @@ package Mail::SpamAssassin::Plugin::TxRep;
 
 use strict;
 use warnings;
-use bytes;
+# use bytes;
 use re 'taint';
 
 use NetAddr::IP 4.000;                          # qw(:upper);
@@ -225,6 +233,7 @@ sub new {                       # constructor: register the eval rule
 
   # only the default conf loaded here, do nothing here requiring
   # the runtime settings
+  dbg("TxRep: new object created");
   return $self;
 }
 
@@ -643,13 +652,16 @@ Used by the SQLBasedAddrList storage implementation.
 
 If this option is set the SQLBasedAddrList module will keep separate
 database entries for DKIM-validated e-mail addresses and for non-validated
-ones. A pre-requisite when setting this option is that a field awl.signedby
-exists in a SQL table, otherwise SQL operations will fail (which is why we
-need this option at all - for compatibility with pre-3.3.0 database schema).
-A plugin DKIM should also be enabled, as otherwise there is no benefit from
-turning on this option.
-
-=back
+ones. Without this option, or for domains that do not use a DKIM signature,
+the reputation of legitimate email can get mixed with the reputation of
+forgeries. A pre-requisite when setting this option is that a field
+txrep.signedby exists in a SQL table, otherwise SQL operations will fail.
+A DKIM plugin must also be enabled in order for this option to take effect.
+This option is highly recommended. Unless you are using a pre-3.3.0 database
+schema and cannot upgrade, there is no reason to disable this option. If
+you are upgrading from AWL and using a pre-3.3.0 schema, the txrep.signedby
+column will not exist. It is recommended that you add this column, but if
+that is not possible you must set this option to 0 to avoid SQL errors.
 
 =cut  # ...................................................................
   push (@cmds, {
@@ -671,6 +683,8 @@ Note: at domains that define the useless SPF +all (pass all), no IP would be
 ever associated with the email address, and all addresses (incl. the froged
 ones) would be treated as coming from the authorized source. However, such
 domains are hopefuly rare, and ask for this kind of treatment anyway.
+
+=back
 
 =cut  # ...................................................................
   push (@cmds, {
@@ -1083,10 +1097,36 @@ sub _fn_envelope {
   unless ($self->{main}->{conf}->{use_txrep}){                                  return 0;}
   unless ($args->{address}) {$self->_message($args->{cli_p},"failed ".$msg);    return 0;}
 
-  my $status;
+  my $factor =	$self->{conf}->{txrep_weight_email} +
+		$self->{conf}->{txrep_weight_email_ip} +
+		$self->{conf}->{txrep_weight_domain} +
+		$self->{conf}->{txrep_weight_ip} +
+		$self->{conf}->{txrep_weight_helo};
+  my $sign = $args->{signedby};
+  my $id     = $args->{address};
+  if ($args->{address} =~ /,/) {
+    $sign = $args->{address};
+    $sign =~ s/^.*,//g;
+    $id   =~ s/,.*$//g;
+  }
+
+  # simplified regex used for IP detection (possible FP at a domain is not critical)
+  if ($id !~ /\./ && $self->{conf}->{txrep_weight_helo}) 
+	{$factor /= $self->{conf}->{txrep_weight_helo}; $sign = 'helo';}
+  elsif ($id =~ /^[a-f\d\.:]+$/ && $self->{conf}->{txrep_weight_ip})
+	{$factor /= $self->{conf}->{txrep_weight_ip};}
+  elsif ($id =~ /@/ && $self->{conf}->{txrep_weight_email})
+	{$factor /= $self->{conf}->{txrep_weight_email};}
+  elsif ($id !~ /@/ && $self->{conf}->{txrep_weight_domain})
+	{$factor /= $self->{conf}->{txrep_weight_domain};}
+  else	{$factor  = 1;}
+
+  $self->open_storages();
+  my $score  = (!defined $value)? undef : $factor * $value;
+  my $status = $self->modify_reputation($id, $score, $sign);
+  dbg("TxRep: $msg %s (score %s) %s", $id, $score || 'undef', $sign || '');
   eval {
-    $status = $self->modify_reputation($args->{address}, $value*$self->count(), $args->{signedby});
-    $self->_message($args->{cli_p}, ($status?"":"error ") . $msg . ": " . $args->{address});
+    $self->_message($args->{cli_p}, ($status?"":"error ") . $msg . ": " . $id);
     if (!defined $self->{txKeepStoreTied}) {$self->finish();}
     1;
   } or return $self->_fail_exit( $@ );
@@ -1100,24 +1140,34 @@ sub _fn_envelope {
 
 When asked by SpamAssassin to blacklist or whitelist a user, the TxRep
 plugin adds a score of 100 (for blacklisting) or -100 (for whitelisting)
-to the given sender for every email recorded in the reputation database. It
-means, if there are 1000 emails from a given sender, his total reputation
-score will increase/decrease by 100,000 points, and the average reputation
-score is pushed close to 100 (blacklisted) or -100 (whitelisted) points (+/-
-the original average). C<reputation> is the average recorded score, which
-is equal to the C<total> / C<count>.
+to the given sender's email address. At a plain address without any IP
+address, the value is multiplied by the ratio of total reputation
+weight to the EMAIL reputation weight to account for the reduced impact
+of the standalone EMAIL reputation when calculating the overall reputation.
 
-   reputation = total / count
-   total = reputation * count
+   total_weight = weight_email + weight_email_ip + weight_domain + weight_ip + weight_helo
+   blacklisted_reputation = 100 * total_weight / weight_email
 
-The following two formulas are equivalent:
+When a standalone email address is blacklisted/whitelisted, all records
+of the email address bound to an IP address, DKIM signature, or a SPF pass
+will be removed from the database, and only the standalone record is kept.
 
-   blacklisted_total = old_total + 100 * count
-   blacklisted_reputation = old_reputation + 100
+Besides blacklisting/whitelisting of standalone email addresses, the same
+method may be used also for blacklisting/whitelisting of IP addresses,
+domain names, and HELO names (only dotless Netbios HELO names can be used).
 
-Blacklisting and whitelisting have the influence only on the reputation of
-the standalone email address. It does not affect the reputation scores of
-the domain name, HELO name, DKIM signature or the originating IP address.
+When whitelisting/blacklisting an email address or domain name, you can
+bind them to a specified DKIM signature or SPF record by appending the 
+DKIM signing domain or the tag 'spf' after the ID in the following way:
+
+ spamassassin --add-addr-to-blacklist=spamming.biz,spf
+ spamassassin --add-addr-to-whitelist=friend@good.org,good.org
+
+When a message contains both a DKIM signature and an SPF pass, the DKIM
+signature takes the priority, so the record bound to the 'spf' tag won't 
+be checked. Only email addresses and domains can be bound to DKIM or SPF.
+Records of IP adresses and HELO names are always without DKIM/SPF.
+
 In case of dual storage, the black/whitelisting is performed only in the
 default storage.
 
@@ -1177,6 +1227,7 @@ sub check_senders_reputation {
   my $autolearn = defined $self->{autolearn};
   $self->{last_pms} = $self->{autolearn} = undef;
 
+  # Cases where we would not be able to use TxRep
   return 0 unless ($self->{conf}->{use_txrep});
   if ($self->{conf}->{use_auto_whitelist}) {
     warn("TxRep: cannot run when Auto-Whitelist is enabled. Please disable it!\n");
@@ -1205,13 +1256,17 @@ sub check_senders_reputation {
   my $domain = $from;
   $domain =~ s/^.+@//;
 
+  # Find the last untrusted relay and populate helo and original IP
   my ($origip, $helo);
   if (defined $pms->{relays_trusted} || defined $pms->{relays_untrusted}) {
     my $trusteds = @{$pms->{relays_trusted}};
     foreach my $rly ( @{$pms->{relays_trusted}}, @{$pms->{relays_untrusted}} ) {
 	# Get the last found HELO, regardless of private/public or trusted/untrusted
 	# Avoiding a redundant duplicate entry if HELO is equal/similar to another identificator
-	if (defined $rly->{helo} && $rly->{helo} !~ /^\[?$rly->{ip}\]?$/ && $rly->{helo} !~ /$domain/i && $rly->{helo} !~ /$from/i ) {
+	if (defined $rly->{helo} &&
+            $rly->{helo} !~ /^\[?\Q$rly->{ip}\E\]?$/ &&
+            $rly->{helo} !~ /^\Q$domain\E$/i &&
+            $rly->{helo} !~ /^\Q$from\E$/i ) {
 	    $helo   = $rly->{helo};
 	}
 	# use only trusted ID, but use the first untrusted IP (if available) (AWL bug 6908)
@@ -1223,6 +1278,7 @@ sub check_senders_reputation {
     }
   }
 
+  # Look for previous scores of the same message, for instance when doing re-learning
   if ($self->{conf}->{txrep_track_messages}) {
     if ($msg_id) {
         my $msg_rep = $self->check_reputations($pms, 'MSG_ID', $msg_id, undef, $date, undef);
@@ -1263,7 +1319,10 @@ sub check_senders_reputation {
     }
   }
 
+  # Get the signing domain
   my $signedby = ($self->{conf}->{auto_whitelist_distinguish_signed})? $pms->get_tag('DKIMDOMAIN') : undef;
+
+  # Summary of all information we've gathered so far
   dbg("TxRep: active, %s pre-score: %s, autolearn score: %s, IP: %s, address: %s %s",
     $msg_id       || '',
     $pms->{score} || '?',
@@ -1279,34 +1338,47 @@ sub check_senders_reputation {
     $domain   = $signedby;
   } elsif ($pms->{spf_pass} && $self->{conf}->{txrep_spf}) {
     $ip       = undef;
-    $signedby = 'SPF';
+    $signedby = 'spf';
   }
 
   my $totalweight      = 0;
   $self->{totalweight} = $totalweight;
 
-                     $delta += $self->check_reputations($pms, 'EMAIL_IP', $from,   $ip,   $signedby, $msgscore);
-  if ($domain)      {$delta += $self->check_reputations($pms, 'DOMAIN',   $domain, $ip,   $signedby, $msgscore);}
-  if ($helo)        {$delta += $self->check_reputations($pms, 'HELO',     $helo,   undef, 'HELO',    $msgscore);}
+  # Get current reputation info
+  $delta += $self->check_reputations($pms, 'EMAIL_IP', $from, $ip, $signedby, $msgscore);
+
+  if ($domain) {
+    $delta += $self->check_reputations($pms, 'DOMAIN', $domain, $ip, $signedby, $msgscore);
+  }
+  if ($helo) {
+    $delta += $self->check_reputations($pms, 'HELO', $helo, undef, 'HELO', $msgscore);
+  }
   if ($origip) {
-    if (!$signedby) {$delta += $self->check_reputations($pms, 'EMAIL',    $from,   undef, undef,     $msgscore);}
-                     $delta += $self->check_reputations($pms, 'IP',       $origip, undef, undef,     $msgscore);
+    if (!$signedby) {
+      $delta += $self->check_reputations($pms, 'EMAIL', $from, undef, undef, $msgscore);
+    }
+    $delta += $self->check_reputations($pms, 'IP', $origip, undef, undef, $msgscore);
   }
 
+  # Learn against this message and store reputation
   if (!defined $self->{learning}) {
     $delta = ($self->{totalweight})? $self->{conf}->{txrep_factor} * $delta / $self->{totalweight}  :  0;
     if ($delta) {
-        $pms->got_hit("TXREP", "TXREP: ", ruletype => 'eval', score => sprintf("%0.3f", $delta));
+      $pms->got_hit("TXREP", "TXREP: ", ruletype => 'eval', score => sprintf("%0.3f", $delta));
     }
     $msgscore += $delta;
     if (defined $pms->{score}) {
-        dbg("TxRep: post-TxRep score: %.3f", $pms->{score});
+      dbg("TxRep: post-TxRep score: %.3f", $pms->{score});
     }
   }
+  # Track message ID
   if ($self->{conf}->{txrep_track_messages} && $msg_id) {
     $self->check_reputations($pms, 'MSG_ID', $msg_id, undef, $date, $msgscore);
   }
-  if (!defined $self->{txKeepStoreTied}) {$self->finish();}
+  # Close any open resources
+  if (!defined $self->{txKeepStoreTied}) {
+    $self->finish();
+  }
 
   return 0;
 }
@@ -1320,14 +1392,16 @@ sub check_reputations {
 
   if ($self->open_storages()) {
     if ($self->{conf}->{txrep_user2global_ratio} && $self->{user_storage} != $self->{global_storage}) {
-        my $user   = $self->check_reputation('user_storage',  @_);
-        my $global = $self->check_reputation('global_storage',@_);
+      my $user   = $self->check_reputation('user_storage',  @_);
+      my $global = $self->check_reputation('global_storage',@_);
 
-        $delta = (defined $user && $user==$user) ?
-            ( $self->{conf}->{txrep_user2global_ratio} * $user + $global ) / ( 1 + $self->{conf}->{txrep_user2global_ratio} ) :
-            $global;
+      if (defined $user and $user == $user) {
+        $delta = ( $self->{conf}->{txrep_user2global_ratio} * $user + $global ) / ( 1 + $self->{conf}->{txrep_user2global_ratio} );
+      } else {
+        $delta = $global;
+      }
     } else {
-        $delta = $self->check_reputation(undef,@_);
+      $delta = $self->check_reputation(undef,@_);
     }
   }
   return $delta;
@@ -1341,6 +1415,29 @@ sub check_reputation {
 
   my $delta  = 0;
   my $weight = ($key eq 'MSG_ID')? 1 : eval('$pms->{main}->{conf}->{txrep_weight_'.lc($key).'}');
+
+#  {
+#    #Bug 7164, trying to find out reason for these: _WARN: Use of uninitialized value $msgscore in addition (+) at /usr/share/perl5/vendor_perl/Mail/SpamAssassin/Plugin/TxRep.pm line 1415.
+#    no warnings;
+#
+#    unless (defined $msgscore) {
+#      #Output some params and the calling function so we can identify more about this bug
+#      dbg("TxRep: MsgScore Undefined (bug 7164) - check_reputation Parameters: self: $self storage: $storage pms: $pms, key: $key, id: $id, ip: $ip, signedby: $signedby, msgscore: $msgscore");
+#      dbg("TxRep: MsgScore Undefined (bug 7164) - weight: $weight");
+#
+#      my ($package, $filename, $line) = caller();
+#
+#      chomp($package);
+#      chomp($filename);
+#      chomp($line);
+#
+#      dbg("TxRep: MsgScore Undefined (bug 7164) - Caller Info: Package: $package - Filename: $filename - Line: $line");
+#
+#      #Define $msgscore as a triage to hide warnings while we find the root cause
+#      #$msgscore = 0;
+#    }
+#  }
+
 
   if (defined $weight && $weight) {
     my $meanrep;
@@ -1369,10 +1466,16 @@ sub check_reputation {
         $self->{totalweight} += $weight;
         if ($key eq 'MSG_ID' && $self->count() > 0) {
             $delta = $self->total() / $self->count();
+	    $pms->set_tag('TXREP'.$tag_id,              sprintf("%2.1f", $delta));
         } elsif (defined $self->total()) {
-            $delta = ($self->total() + $msgscore) / (1 + $self->count()) - $msgscore;
+            #Bug 7164 - $msgscore undefined
+            if (defined $msgscore) {
+              $delta = ($self->total() + $msgscore) / (1 + $self->count()) - $msgscore;
+            } else {
+              $delta = ($self->total()) / (1 + $self->count());
+            }
 
-            $pms->set_tag('TXREP_'.$tag_id,             sprintf("%2.1f",$delta));
+            $pms->set_tag('TXREP_'.$tag_id,             sprintf("%2.1f", $delta));
             if (defined $meanrep) {
                 $pms->set_tag('TXREP_'.$tag_id.'_MEAN', sprintf("%2.1f", $meanrep));
             }
@@ -1406,7 +1509,9 @@ sub check_reputation {
         $self->{checker}->remove_entry($self->{entry}); #forgetting the message ID
     }
   }
-  if (defined $storage) {$self->{checker} = $self->{default_storage};}
+  if (defined $storage) {
+    $self->{checker} = $self->{default_storage};
+  }
 
   return ($weight || 0) * ($delta || 0);
 }
@@ -1428,7 +1533,7 @@ sub get_sender {
 ###########################################################################
   my ($self, $addr, $origip, $signedby) = @_;
 
-  return undef unless (defined $self->{checker});
+  return unless (defined $self->{checker});
 
   my $fulladdr   = $self->pack_addr($addr, $origip);
   my $entry      = $self->{checker}->get_addr_entry($fulladdr, $signedby);
@@ -1448,11 +1553,11 @@ sub add_score {
 ###########################################################################
   my ($self,$score) = @_;
 
-  return undef unless (defined $self->{checker});       # no factory defined; we can't check
+  return unless (defined $self->{checker});       # no factory defined; we can't check
 
   if ($score != $score) {
     warn "TxRep: attempt to add a $score to TxRep entry ignored\n";
-    return undef;                                       # don't try to add a NaN
+    return;                                       # don't try to add a NaN
   }
   $self->{entry}->{count} ||= 0;
 
@@ -1476,11 +1581,11 @@ sub remove_score {
 ###########################################################################
   my ($self,$score) = @_;
 
-  return undef unless (defined $self->{checker});       # no factory defined; we can't check
+  return unless (defined $self->{checker});       # no factory defined; we can't check
 
   if ($score != $score) {                               # don't try to add a NaN
     warn "TxRep: attempt to add a $score to TxRep entry ignored\n";
-    return undef;
+    return;
   }
   # no reversal dilution aging correction (not easily possible),
   # just removing the original message score
@@ -1498,7 +1603,7 @@ sub modify_reputation {
 ###########################################################################
   my ($self, $addr, $score, $signedby) = @_;
 
-  return undef unless (defined $self->{checker});       # no factory defined; we can't check
+  return unless (defined $self->{checker});       # no factory defined; we can't check
   my $fulladdr = $self->pack_addr($addr, undef);
   my $entry    = $self->{checker}->get_addr_entry($fulladdr, $signedby);
 
@@ -1524,7 +1629,8 @@ sub open_storages {
 ###########################################################################
   my $self = shift;
 
-  return 1 unless (!defined $self->{default_storage});
+  # disabled per bug 7191
+  #return 1 unless (!defined $self->{default_storage});
 
   my $factory;
   if ($self->{main}->{pers_addr_list_factory}) {
@@ -1552,7 +1658,7 @@ sub open_storages {
 	# TODO: add an a method to the handler class instead
 	my ($storage_type, $is_global);
 	
-	if (ref($factory) =~ /SQLasedAddrList/) {
+	if (ref($factory) =~ /SQLBasedAddrList/) {
 	    $is_global    = defined $self->{conf}->{user_awl_sql_override_username};
 	    $storage_type = 'SQL';
 	    if ($is_global && $self->{conf}->{user_awl_sql_override_username} eq $self->{main}->{username}) {
@@ -1605,7 +1711,7 @@ sub finish {
 ###########################################################################
   my $self = shift;
 
-  return undef unless (defined $self->{checker});       # no factory defined; we can't check
+  return unless (defined $self->{checker});       # no factory defined; we can't check
 
   if ($self->{conf}->{txrep_user2global_ratio} && defined $self->{user_storage} && ($self->{user_storage} != $self->{global_storage})) {
     $self->{user_storage}->finish();
@@ -1726,9 +1832,9 @@ sub learn_message {
 ###########################################################################
   my ($self, $params) = @_;
   return 0 unless (defined $params->{isspam});
+
   dbg("TxRep: learning a message");
   my $pms = ($self->{last_pms})? $self->{last_pms} : Mail::SpamAssassin::PerMsgStatus->new($self->{main}, $params->{msg});
-
   if (!defined $pms->{relays_internal} && !defined $pms->{relays_external}) {
     $pms->extract_message_metadata();
   }
@@ -1836,30 +1942,19 @@ initializing the SQL storage, the same instructions apply also to TxRep.
 Although the old AWL table can be reused for TxRep, by default TxRep expects
 the SQL table to be named "txrep".
 
-To install a new SQL table for TxRep, save the 'CREATE' SQL command shown
-below into a file named txrep_mysql.sql, and use the following command. You
-can also simply run the SQL command from within the respective database
-area in PhpMyAdmin:
+To install a new SQL table for TxRep, run the appropriate SQL file for your
+system under the /sql directory.
 
- mysql -h <hostname> -u <adminusername> -p <databasename> < txrep_mysql.sql
- Enter password: <adminpassword>
-
- CREATE TABLE txrep (
-   username varchar(100) NOT NULL default '',
-   email varchar(255) NOT NULL default '',
-   ip varchar(40) NOT NULL default '',
-   count int(11) NOT NULL default '0',
-   totscore float NOT NULL default '0',
-   signedby varchar(255) NOT NULL default '',
-   PRIMARY KEY (username,email,signedby,ip)
- ) ENGINE=MyISAM;
-
-(If you get a syntax error at an older version of MySQL, use TYPE=MyISAM
-instead of ENGINE=MyISAM at the end of the command)
-
-For PostgreSQL, use the following:
-
- psql -U <username> -f txrep_pg.sql <databasename>
+If you get a syntax error at an older version of MySQL, use TYPE=MyISAM
+instead of ENGINE=MyISAM at the end of the command. You can also use other
+types of ENGINE (depending on what is available on your system). For example
+MEMORY engine stores the entire table in the server memory, achieving
+performance similar to Redis. You would need to care about the replication
+of the RAM table to disk through a cronjob, to avoid loss of data at reboot.
+The InnoDB engine is used by default, offering high scalability (database
+size and concurence of accesses). In conjunction with a high value of
+innodb_buffer_pool or with the memcached plugin (MySQL v5.6+) it can also
+offer performance comparable to Redis.
 
 =cut
 

@@ -19,12 +19,14 @@ package Mail::SpamAssassin::Plugin::HeaderEval;
 
 use strict;
 use warnings;
-use bytes;
+# use bytes;
 use re 'taint';
 use Errno qw(EBADF);
 
 use Mail::SpamAssassin::Plugin;
 use Mail::SpamAssassin::Locales;
+use Mail::SpamAssassin::Util qw(get_my_locales parse_rfc822_date
+                                idn_to_ascii is_valid_utf_8);
 use Mail::SpamAssassin::Logger;
 use Mail::SpamAssassin::Constants qw(:sa :ip);
 
@@ -116,7 +118,7 @@ sub check_for_faraway_charset_in_headers {
   my ($self, $pms) = @_;
   my $hdr;
 
-  my @locales = Mail::SpamAssassin::Util::get_my_locales($self->{main}->{conf}->{ok_locales});
+  my @locales = get_my_locales($self->{main}->{conf}->{ok_locales});
 
   return 0 if grep { $_ eq "all" } @locales;
 
@@ -274,6 +276,17 @@ sub check_illegal_chars {
     # fix continuation lines, then remove Subject and From
     $str =~ s/\n[ \t]+/  /gs;
     $str =~ s/^(?:Subject|From):.*$//gmi;
+  }
+
+  if ($str =~ tr/\x00-\x7F//c && is_valid_utf_8($str)) {
+    # is non-ASCII and is valid UTF-8
+    if ($str =~ tr/\x00-\x08\x0B\x0C\x0E-\x1F//) {
+      dbg("eval: %s is valid UTF-8 but contains controls: %s", $header, $str);
+    } else {
+      # todo: only with a SMTPUTF8 mail
+      dbg("eval: %s is valid UTF-8: %s", $header, $str);
+      return 0;
+    }
   }
 
   # count illegal substrings (RFC 2045)
@@ -722,7 +735,7 @@ sub _get_date_header_time {
     for my $date (@dates) {
       if (defined($date) && length($date)) {
         chomp($date);
-        $time = Mail::SpamAssassin::Util::parse_rfc822_date($date);
+        $time = parse_rfc822_date($date);
       }
       last DATE if defined($time);
     }
@@ -773,7 +786,7 @@ sub _get_received_header_times {
       if ($rcvd =~ m/(\s.?\d+ \S\S\S \d+ \d+:\d+:\d+ \S+)/) {
 	my $date = $1;
         dbg2("eval: trying Received fetchmail header date for real time: $date");
-	my $time = Mail::SpamAssassin::Util::parse_rfc822_date($date);
+	my $time = parse_rfc822_date($date);
 	if (defined($time) && (time() >= $time)) {
           dbg2("eval: time_t from date=$time, rcvd=$date");
 	  push @fetchmail_times, $time;
@@ -793,7 +806,7 @@ sub _get_received_header_times {
     if ($rcvd =~ m/(\s.?\d+ \S\S\S \d+ \d+:\d+:\d+ \S+)/) {
       my $date = $1;
       dbg2("eval: trying Received header date for real time: $date");
-      my $time = Mail::SpamAssassin::Util::parse_rfc822_date($date);
+      my $time = parse_rfc822_date($date);
       if (defined($time)) {
         dbg2("eval: time_t from date=$time, rcvd=$date");
 	push @header_times, $time;
@@ -953,14 +966,14 @@ sub check_outlook_message_id {
   my $fudge = 250;
 
   $_ = $pms->get('Date');
-  $_ = Mail::SpamAssassin::Util::parse_rfc822_date($_) || 0;
+  $_ = parse_rfc822_date($_) || 0;
   my $expected = int (($_ * $x) + $y);
   my $diff = $timetoken - $expected;
   return 0 if (abs($diff) < $fudge);
 
   $_ = $pms->get('Received');
   /(\s.?\d+ \S\S\S \d+ \d+:\d+:\d+ \S+).*?$/;
-  $_ = Mail::SpamAssassin::Util::parse_rfc822_date($_) || 0;
+  $_ = parse_rfc822_date($_) || 0;
   $expected = int(($_ * $x) + $y);
   $diff = $timetoken - $expected;
 
@@ -1035,11 +1048,11 @@ sub check_ratware_envelope_from {
   return 0 if $from eq '' || $to eq '';
   return 0 if $from =~ /^SRS\d=/;
 
-  if ($to =~ /^([^@]+)@(.+)$/) {
+  if ($to =~ /^([^@]+)\@(.+)$/) {
     my($user,$dom) = ($1,$2);
-    $dom = Mail::SpamAssassin::Util::RegistrarBoundaries::trim_domain($dom);
+    $dom = $self->{main}->{registryboundaries}->trim_domain($dom);
     return unless
-        (Mail::SpamAssassin::Util::RegistrarBoundaries::is_domain_valid($dom));
+        ($self->{main}->{registryboundaries}->is_domain_valid($dom));
 
     return 1 if ($from =~ /\b\Q$dom\E.\Q$user\E@/i);
   }

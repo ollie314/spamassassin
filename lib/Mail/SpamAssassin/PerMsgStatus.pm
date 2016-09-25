@@ -55,12 +55,13 @@ use re 'taint';
 
 use Errno qw(ENOENT);
 use Time::HiRes qw(time);
+use Encode;
 
 use Mail::SpamAssassin::Constants qw(:sa);
 use Mail::SpamAssassin::AsyncLoop;
 use Mail::SpamAssassin::Conf;
-use Mail::SpamAssassin::Util qw(untaint_var uri_list_canonicalize);
-use Mail::SpamAssassin::Util::RegistrarBoundaries;
+use Mail::SpamAssassin::Util qw(untaint_var base64_encode idn_to_ascii
+                                uri_list_canonicalize);
 use Mail::SpamAssassin::Timeout;
 use Mail::SpamAssassin::Logger;
 
@@ -191,26 +192,21 @@ BEGIN {
     TESTS => sub {
       my $pms = shift;
       my $arg = (shift || ',');
-      join($arg, sort(@{$pms->{test_names_hit}})) || "none";
+      join($arg, sort @{$pms->{test_names_hit}}) || "none";
     },
 
     SUBTESTS => sub {
       my $pms = shift;
       my $arg = (shift || ',');
-      join($arg, sort(@{$pms->{subtest_names_hit}})) || "none";
+      join($arg, sort @{$pms->{subtest_names_hit}}) || "none";
     },
 
     TESTSSCORES => sub {
       my $pms = shift;
       my $arg = (shift || ",");
-      my $line = '';
-      foreach my $test (sort @{$pms->{test_names_hit}}) {
-        my $score = $pms->{conf}->{scores}->{$test};
-        $score = '0'  if !defined $score;
-        $line .= $arg  if $line ne '';
-        $line .= $test . "=" . $score;
-      }
-      $line ne '' ? $line : 'none';
+      my $scores = $pms->{conf}->{scores};
+      join($arg, map($_ . "=" . ($scores->{$_} || '0'),
+                     sort @{$pms->{test_names_hit}})) || "none";
     },
 
     PREVIEW => sub {
@@ -389,7 +385,8 @@ sub check_timed {
     # did anything happen?  if not, this is fatal
     if (!$self->{main}->have_plugin("check_main")) {
       die "check: no loaded plugin implements 'check_main': cannot scan!\n".
-            "Check the necessary '.pre' files are in the config directory.\n";
+            "Check that the necessary '.pre' files are in the config directory.\n".
+              "At a minimum, v320.pre loads the Check plugin which is required.\n";
     }
   }
 
@@ -725,7 +722,7 @@ of the tests which were triggered by the mail.
 sub get_names_of_tests_hit {
   my ($self) = @_;
 
-  return join(',', sort(@{$self->{test_names_hit}}));
+  return join(',', sort @{$self->{test_names_hit}});
 }
 
 =item $list = $status->get_names_of_tests_hit_with_scores_hash ()
@@ -738,16 +735,10 @@ test names and individual scores of the tests which were triggered by the mail.
 sub get_names_of_tests_hit_with_scores_hash {
   my ($self) = @_;
 
-  my ($line, %testsscores);
-
-  #BASED ON CODE FOR TESTSSCORES TAG - KAM 2014-04-24
-  foreach my $test (@{$self->{test_names_hit}}) {
-    my $score = $self->{conf}->{scores}->{$test};
-    $score = '0'  if !defined $score;
-
-    $testsscores{$test} = $score;
-  }
-
+  #BASED ON CODE FOR TESTSSCORES TAG
+  my $scores = $self->{conf}->{scores};
+  my %testsscores;
+  $testsscores{$_} = $scores->{$_} || '0'  for @{$self->{test_names_hit}};
   return \%testsscores;
 }
 
@@ -761,19 +752,10 @@ test names and individual scores of the tests which were triggered by the mail.
 sub get_names_of_tests_hit_with_scores {
   my ($self) = @_;
 
-  my ($line, %testsscores);
-
-  #BASED ON CODE FOR TESTSSCORES TAG - KAM 2014-04-24
-  foreach my $test (sort @{$self->{test_names_hit}}) {
-    my $score = $self->{conf}->{scores}->{$test};
-    $score = '0'  if !defined $score;
-    $line .= ','  if $line ne '';
-    $line .= $test . '=' . $score;
-  }
-
-  $line ||= 'none';
-
-  return $line;
+  #BASED ON CODE FOR TESTSSCORES TAG
+  my $scores = $self->{conf}->{scores};
+  return join(',', map($_ . '=' . ($scores->{$_} || '0'),
+                       sort @{$self->{test_names_hit}})) || "none";
 }
 
 
@@ -792,7 +774,7 @@ underscores, used in meta rules.
 sub get_names_of_subtests_hit {
   my ($self) = @_;
 
-  return join(',', sort(@{$self->{subtest_names_hit}}));
+  return join(',', sort @{$self->{subtest_names_hit}});
 }
 
 ###########################################################################
@@ -1024,7 +1006,7 @@ sub _get_added_headers {
   foreach my $hf_ref (@{$self->{conf}->{$which}}) {
     my($hfname, $hfbody) = @$hf_ref;
     my $line = $self->_process_header($hfname,$hfbody);
-    $line = $self->qp_encode_header($line);
+    $line = $self->mime_encode_header($line);
     $str .= "X-Spam-$hfname: $line\n";
   }
   return $str;
@@ -1044,21 +1026,23 @@ sub rewrite_report_safe {
   # This is the new message.
   my $newmsg = '';
 
-  # the report charset
-  my $report_charset = "; charset=iso-8859-1";
-  if ($self->{conf}->{report_charset}) {
-    $report_charset = "; charset=" . $self->{conf}->{report_charset};
-  }
+  # the character set of a report
+  my $report_charset = $self->{conf}->{report_charset} || "UTF-8";
 
   # the SpamAssassin report
   my $report = $self->get_report();
 
-  # If there are any wide characters, need to MIME-encode in UTF-8
-  # TODO: If $report_charset is something other than iso-8859-1/us-ascii, then
-  # we could try converting to that charset if possible
-  unless ($] < 5.008 || utf8::downgrade($report, 1)) {
-      $report_charset = "; charset=utf-8";
-      utf8::encode($report);
+  if (!utf8::is_utf8($report)) {
+    # already in octets
+  } else {
+    # encode to octets
+    if (uc $report_charset eq 'UTF-8') {
+      dbg("check: encoding report to $report_charset");
+      utf8::encode($report);  # very fast
+    } else {
+      dbg("check: encoding report to $report_charset. Slow, to be avoided!");
+      $report = Encode::encode($report_charset, $report);  # slow
+    }
   }
 
   # get original headers, "pristine" if we can do it
@@ -1171,7 +1155,7 @@ Content-Type: multipart/mixed; boundary="$boundary"
 This is a multi-part message in MIME format.
 
 --$boundary
-Content-Type: text/plain$report_charset
+Content-Type: text/plain; charset=$report_charset
 Content-Disposition: inline
 Content-Transfer-Encoding: 8bit
 
@@ -1286,35 +1270,59 @@ sub rewrite_no_report_safe {
   return $newmsg.$self->{msg}->get_pristine_body();
 }
 
-sub qp_encode_header {
+# encode a header field body into ASCII as per RFC 2047
+#
+sub mime_encode_header {
   my ($self, $text) = @_;
 
-  # do nothing unless there's an 8-bit char
-  return $text unless ($text =~ /[\x80-\xff]/);
+  utf8::encode($text)  if utf8::is_utf8($text);
 
-  my $cs = 'ISO-8859-1';
-  if ($self->{report_charset}) {
-    $cs = $self->{report_charset};
+  my $result = '';
+  for my $line (split(/^/, $text)) {
+
+    if ($line =~ /^[\x09\x20-\x7E]*\r?\n\z/s) {
+      $result .= $line;  # no need for encoding
+
+    } else {
+      my $prefix = '';
+      my $suffix = '';
+
+      local $1;
+      if ($line =~ s/( (?: ^ | [ \t] ) [\x09\x20-\x7E]* (?: \r?\n )? ) \z//xs) {
+        $suffix = $1;
+      } elsif ($line =~ s/(\r?\n)\z//s) {
+        $suffix = $1;
+      }
+
+      if ($line =~ s/^ ( [\x09\x20-\x7E]* (?: [ \t] | \z ) )//xs) {
+        $prefix = $1;
+      }
+
+      if ($line eq '') {
+        $result .= $prefix . $suffix;
+      } else {
+        my $qp_enc_count = $line =~ tr/=?_\x00-\x1F\x7F-\xFF//;
+        if (length($line) + $qp_enc_count*2 <= 4 * int(length($line)+2)/3) {
+          # RFC 2047: Upper case should be used for hex digits A through F
+          $line =~ s{ ( [=?_\x00-\x20\x7F-\xFF] ) }
+                    { $1 eq ' ' ? '_' : sprintf("=%02X", ord $1) }xges;
+          $result .= $prefix . '=?UTF-8?Q?' . $line;
+        } else {
+          $result .= $prefix . '=?UTF-8?B?' . base64_encode($line);
+        }
+        $result .= '?=' . $suffix;
+      }
+    }
   }
 
-  my @hexchars = split('', '0123456789abcdef');
-  my $ord;
-  local $1;
-  $text =~ s{([\x80-\xff])}{
-		$ord = ord $1;
-		'='.$hexchars[($ord & 0xf0) >> 4].$hexchars[$ord & 0x0f]
-	}ges;
-
-  $text = '=?'.$cs.'?Q?'.$text.'?=';
-
-  dbg("markup: encoding header in $cs: $text");
-  return $text;
+  dbg("markup: mime_encode_header: %s", $result);
+  return $result;
 }
 
 sub _process_header {
   my ($self, $hdr_name, $hdr_data) = @_;
 
-  $hdr_data = $self->_replace_tags($hdr_data);
+  $hdr_data = $self->_replace_tags($hdr_data);  # as octets
   $hdr_data =~ s/(?:\r?\n)+$//; # make sure there are no trailing newlines ...
 
   if ($self->{conf}->{fold_headers}) {
@@ -1352,7 +1360,13 @@ sub _replace_tags {
           # _get_tag on an attempt to use such tag in add_header template
         } else {
           $result = $self->get_tag_raw($tag,$3);
-          $result = join(' ',@$result)  if ref $result eq 'ARRAY';
+          if (!ref $result) {
+            utf8::encode($result) if utf8::is_utf8($result);
+          } elsif (ref $result eq 'ARRAY') {
+            my @values = @$result;  # avoid modifying referenced array
+            for (@values) { utf8::encode($_) if utf8::is_utf8($_) }
+            $result = join(' ', @values);
+          }
         }
         defined $result ? $result : $full;
       }ge;
@@ -1714,23 +1728,28 @@ sub extract_message_metadata {
     $self->{$item} = $self->{msg}->{metadata}->{$item};
   }
 
-  # TODO: International domain names (UTF-8) must be converted to
-  # ASCII-compatible encoding (ACE) for the purpose of setting the
-  # SENDERDOMAIN and AUTHORDOMAIN tags (and probably for other uses too).
-  # (explicitly required for DMARC, draft-kucherawy-dmarc-base sect. 5.6.1)
+  # International domain names (UTF-8) must be converted to ASCII-compatible
+  # encoding (ACE) for the purpose of setting the SENDERDOMAIN and AUTHORDOMAIN
+  # tags (explicitly required for DMARC, RFC 7489)
   #
   { local $1;
     my $addr = $self->get('EnvelopeFrom:addr', undef);
     # collect a FQDN, ignoring potential trailing WSP
     if (defined $addr && $addr =~ /\@([^@. \t]+\.[^@ \t]+?)[ \t]*\z/s) {
-      $self->set_tag('SENDERDOMAIN', lc $1);
+      my $d = idn_to_ascii($1);
+      $self->set_tag('SENDERDOMAIN', $d);
+      $self->{msg}->put_metadata("X-SenderDomain", $d);
+      dbg("metadata: X-SenderDomain: %s", $d);
     }
     # TODO: the get ':addr' only returns the first address; this should be
     # augmented to be able to return all addresses in a header field, multiple
     # addresses in a From header field are allowed according to RFC 5322
     $addr = $self->get('From:addr', undef);
     if (defined $addr && $addr =~ /\@([^@. \t]+\.[^@ \t]+?)[ \t]*\z/s) {
-      $self->set_tag('AUTHORDOMAIN', lc $1);
+      my $d = idn_to_ascii($1);
+      $self->set_tag('AUTHORDOMAIN', $d);
+      $self->{msg}->put_metadata("X-AuthorDomain", $d);
+      dbg("metadata: X-AuthorDomain: %s", $d);
     }
   }
 
@@ -1980,7 +1999,8 @@ sub _get {
   else {
     my @results = $getraw ? $self->{msg}->raw_header($request)
                           : $self->{msg}->get_header($request);
-  # dbg("message: get(%s) = %s", $request, join(", ",@results));
+  # dbg("message: get(%s)%s = %s",
+  #     $request, $getraw?'raw':'', join(", ",@results));
     if (@results) {
       $result = join('', @results);
     } else {  # metadata
@@ -2107,30 +2127,39 @@ sub get {
 #
 # bug 4522: ISO2022 format mail, most commonly Japanese SHIFT-JIS, inserts a three character escape sequence  ESC ( .
 
-# a hybrid of tbird and oe's  version of uri parsing
-my $tbirdstartdelim = '><"\'`,{[(|\s'  . "\x1b";  # The \x1b as per bug 4522
-my $iso2022shift = "\x1b" . '\(.';  # bug 4522
-my $tbirdenddelim = '><"`}\]{[|\s' . "\x1b";  # The \x1b as per bug 4522
-my $oeignoreatend = '-~!@#^&*()_+=:;\'?,.';
-my $nonASCII    = '\x80-\xff';
+sub _tbirdurire {
+  my ($self) = @_;
 
-# bug 7100: we allow a comma to delimit the end of an email address because it will never appear in a domain name, and
-# it's a common thing to find in text
-my $tbirdenddelimemail = $tbirdenddelim . ',(\'' . $nonASCII;  # tbird ignores non-ASCII mail addresses for now, until RFC changes
-my $tbirdenddelimplusat = $tbirdenddelimemail . '@';
+  # Cached?
+  return $self->{tbirdurire} if $self->{tbirdurire};
 
-# valid TLDs
-my $tldsRE = $Mail::SpamAssassin::Util::RegistrarBoundaries::VALID_TLDS_RE;
+  # a hybrid of tbird and oe's  version of uri parsing
+  my $tbirdstartdelim = '><"\'`,{[(|\s'  . "\x1b";  # The \x1b as per bug 4522
+  my $iso2022shift = "\x1b" . '\(.';  # bug 4522
+  my $tbirdenddelim = '><"`}\]{[|\s' . "\x1b";  # The \x1b as per bug 4522
+  my $nonASCII    = '\x80-\xff';
 
-# knownscheme regexp looks for either a https?: or ftp: scheme, or www\d*\. or ftp\. prefix, i.e., likely to start a URL
-# schemeless regexp looks for a valid TLD at the end of what may be a FQDN, followed by optional ., optional :portnum, optional /rest_of_uri
-my $urischemeless = qr/[a-z\d][a-z\d._-]{0,251}\.${tldsRE}\.?(?::\d{1,5})?(?:\/[^$tbirdenddelim]{1,251})?/io;
-my $uriknownscheme = qr/(?:(?:(?:(?:https?)|(?:ftp)):(?:\/\/)?)|(?:(?:www\d{0,2}|ftp)\.))[^$tbirdenddelim]{1,251}/io;
-my $urimailscheme = qr/(?:mailto:)?[^$tbirdenddelimplusat]{1,251}@[^$tbirdenddelimemail]{1,251}/io;
-my $tbirdurire = qr/(?:\b|(?<=$iso2022shift)|(?<=[$tbirdstartdelim]))
-                    (?:(?:($uriknownscheme)(?=(?:[$tbirdenddelim]|\z))) |
-                       (?:($urimailscheme)(?=(?:[$tbirdenddelimemail]|\z))) |
-                       (?:\b($urischemeless)(?=(?:[$tbirdenddelim]|\z))))/xo;
+  # bug 7100: we allow a comma to delimit the end of an email address because it will never appear in a domain name, and
+  # it's a common thing to find in text
+  my $tbirdenddelimemail = $tbirdenddelim . ',(\'' . $nonASCII;  # tbird ignores non-ASCII mail addresses for now, until RFC changes
+  my $tbirdenddelimplusat = $tbirdenddelimemail . '@';
+
+  # valid TLDs
+  my $tldsRE = $self->{main}->{registryboundaries}->{valid_tlds_re};
+
+  # knownscheme regexp looks for either a https?: or ftp: scheme, or www\d*\. or ftp\. prefix, i.e., likely to start a URL
+  # schemeless regexp looks for a valid TLD at the end of what may be a FQDN, followed by optional ., optional :portnum, optional /rest_of_uri
+  my $urischemeless = qr/[a-z\d][a-z\d._-]{0,251}\.${tldsRE}\.?(?::\d{1,5})?(?:\/[^$tbirdenddelim]{1,251})?/io;
+  my $uriknownscheme = qr/(?:(?:(?:(?:https?)|(?:ftp)):(?:\/\/)?)|(?:(?:www\d{0,2}|ftp)\.))[^$tbirdenddelim]{1,251}/io;
+  my $urimailscheme = qr/(?:mailto:)?[^$tbirdenddelimplusat]{1,251}@[^$tbirdenddelimemail]{1,251}/io;
+
+  $self->{tbirdurire} = qr/(?:\b|(?<=$iso2022shift)|(?<=[$tbirdstartdelim]))
+                        (?:(?:($uriknownscheme)(?=(?:[$tbirdenddelim]|\z))) |
+                        (?:($urimailscheme)(?=(?:[$tbirdenddelimemail]|\z))) |
+                        (?:\b($urischemeless)(?=(?:[$tbirdenddelim]|\z))))/xo;
+
+  return $self->{tbirdurire};
+}
 
 =item $status->get_uri_list ()
 
@@ -2264,7 +2293,7 @@ sub get_uri_detail_list {
     $info->{cleaned} = \@tmp;
 
     foreach (@tmp) {
-      my($domain,$host) = Mail::SpamAssassin::Util::uri_to_domain($_);
+      my($domain,$host) = $self->{main}->{registryboundaries}->uri_to_domain($_);
       if (defined $host && $host ne '' && !$info->{hosts}->{$host}) {
         # unstripped full host name as a key, and its domain part as a value
         $info->{hosts}->{$host} = $domain;
@@ -2305,7 +2334,7 @@ sub get_uri_detail_list {
       $info->{cleaned} = \@uris;
 
       foreach (@uris) {
-        my($domain,$host) = Mail::SpamAssassin::Util::uri_to_domain($_);
+        my($domain,$host) = $self->{main}->{registryboundaries}->uri_to_domain($_);
         if (defined $host && $host ne '' && !$info->{hosts}->{$host}) {
           # unstripped full host name as a key, and its domain part as a value
           $info->{hosts}->{$host} = $domain;
@@ -2353,6 +2382,7 @@ sub _get_parsed_uri_list {
 
     my ($rulename, $pat, @uris);
     my $text;
+    my $tbirdurire = $self->_tbirdurire;
 
     for my $entry (@$textary) {
 
@@ -2368,7 +2398,7 @@ sub _get_parsed_uri_list {
       while (/$tbirdurire/igo) {
         my $rawuri = $1||$2||$3;
         $rawuri =~ s/(^[^(]*)\).*$/$1/;  # as per ThunderBird, ) is an end delimiter if there is no ( preceeding it
-        $rawuri =~ s/[$oeignoreatend]*$//; # remove trailing string of punctuations that TBird ignores
+        $rawuri =~ s/[-~!@#^&*()_+=:;\'?,.]*$//; # remove trailing string of punctuations that TBird ignores
         # skip if there is '..' in the hostname portion of the URI, something we can't catch in the general URI regexp
         next if $rawuri =~ /^(?:(?:https?|ftp|mailto):(?:\/\/)?)?[a-z\d.-]*\.\./i;
 
@@ -2397,9 +2427,9 @@ sub _get_parsed_uri_list {
 
         if ($uri =~ /^mailto:/i) {
           # skip a mail link that does not have a valid TLD or other than one @ after decoding any URLEncoded characters
-          $uri = Mail::SpamAssassin::Util::url_encode($uri) if ($uri =~ /\%(?:2[1-9a-fA-F]|[3-6][0-9a-fA-f]|7[0-9a-eA-E])/);
+          $uri = Mail::SpamAssassin::Util::url_encode($uri) if ($uri =~ /\%(?:2[1-9a-fA-F]|[3-6][0-9a-fA-F]|7[0-9a-eA-E])/);
           next if ($uri !~ /^[^@]+@[^@]+$/);
-          my $domuri = Mail::SpamAssassin::Util::uri_to_domain($uri);
+          my $domuri = $self->{main}->{registryboundaries}->uri_to_domain($uri);
           next unless $domuri;
           push (@uris, $rawuri);
           push (@uris, $uri) unless ($rawuri eq $uri);
@@ -2410,7 +2440,7 @@ sub _get_parsed_uri_list {
         my @tmp = uri_list_canonicalize($redirector_patterns, $uri);
         my $goodurifound = 0;
         foreach my $cleanuri (@tmp) {
-          my $domain = Mail::SpamAssassin::Util::uri_to_domain($cleanuri);
+          my $domain = $self->{main}->{registryboundaries}->uri_to_domain($cleanuri);
           if ($domain) {
             # bug 5780: Stop after domain to avoid FP, but do that after all deobfuscation of urlencoding and redirection
             if ($rblonly) {
@@ -3063,24 +3093,25 @@ sub all_from_addrs_domains {
 
   #TEST POINT - my @addrs = ("test.voipquotes2.net","test.voipquotes2.co.uk");
   #Start with all the normal from addrs
-  my @addrs = &all_from_addrs($self);
+  my @addrs = all_from_addrs($self);
 
   dbg("eval: all '*From' addrs domains (before): " . join(" ", @addrs));
 
-  #loop through and limit to just the domain with a dummy address
-  for (my $i = 0; $i < scalar(@addrs); $i++) {
-    $addrs[$i] = 'dummy@'.&Mail::SpamAssassin::Util::uri_to_domain($addrs[$i]);
+  #Take just the domain with a dummy localpart
+  #removing invalid and duplicate domains
+  my(%addrs_seen, @addrs_filtered);
+  foreach my $a (@addrs) {
+    my $domain = $self->{main}->{registryboundaries}->uri_to_domain($a);
+    next if !defined $domain || $addrs_seen{lc $domain}++;
+    push(@addrs_filtered, 'dummy@'.$domain);
   }
 
-  #Remove duplicate domains
-  my %addrs = map { $_ => 1 } @addrs;
-  @addrs = keys %addrs;
+  dbg("eval: all '*From' addrs domains (after uri to domain): " .
+      join(" ", @addrs_filtered));
 
-  dbg("eval: all '*From' addrs domains (after uri to domain): " . join(" ", @addrs));
+  $self->{all_from_addrs_domains} = \@addrs_filtered;
 
-  $self->{all_from_addrs_domains} = \@addrs;
-
-  return @addrs;
+  return @addrs_filtered;
 }
 
 sub all_to_addrs {

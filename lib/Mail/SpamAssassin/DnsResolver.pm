@@ -37,13 +37,15 @@ package Mail::SpamAssassin::DnsResolver;
 
 use strict;
 use warnings;
-use bytes;
+# use bytes;
 use re 'taint';
+
+require 5.008001;  # needs utf8::is_utf8()
 
 use Mail::SpamAssassin;
 use Mail::SpamAssassin::Logger;
 use Mail::SpamAssassin::Constants qw(:ip);
-use Mail::SpamAssassin::Util qw(untaint_var decode_dns_question_entry);
+use Mail::SpamAssassin::Util qw(untaint_var decode_dns_question_entry idn_to_ascii);
 
 use Socket;
 use Errno qw(EADDRINUSE EACCES);
@@ -579,7 +581,7 @@ sub new_dns_packet {
     #    time, $domain, $type, $packet->id);
     1;
   } or do {
-    # this can if a domain name in a query is invalid, or if a timeout signal
+    # get here if a domain name in a query is invalid, or if a timeout signal
     # happened to be trapped by this eval, or if Net::DNS signalled an error
     my $eval_stat = $@ ne '' ? $@ : "errno=$!";  chomp $eval_stat;
     # resignal if alarm went off
@@ -590,6 +592,9 @@ sub new_dns_packet {
   };
 
   if ($packet) {
+    # RD flag needs to be set explicitly since Net::DNS 1.01, Bug 7223	
+    $packet->header->rd(1);
+
   # my $udp_payload_size = $self->{res}->udppacketsize;
     my $udp_payload_size = $self->{conf}->{dns_options}->{edns};
     if ($udp_payload_size && $udp_payload_size > 512) {
@@ -669,7 +674,7 @@ be used, like so:
 
   my $id = $self->{resolver}->bgsend($domain, $type, undef, sub {
         my ($reply, $reply_id, $timestamp) = @_;
-        $self->got_a_reply ($reply, $reply_id);
+        $self->got_a_reply($reply, $reply_id);
       });
 
 The callback can ignore the reply as an invalid packet sent to the listening
@@ -716,6 +721,38 @@ sub bgsend {
   dbg("dns: providing a callback for id: $id");
   $self->{id_to_callback}->{$id} = $cb;
   return $id;
+}
+
+###########################################################################
+
+=item $id = $res->bgread()
+
+Similar to C<Net::DNS::Resolver::bgread>.  Reads a DNS packet from
+a supplied socket, decodes it, and returns a Net::DNS::Packet object
+if successful.  Dies on error.
+
+=cut
+
+sub bgread() {
+  my ($self) = @_;
+  my $sock = $self->{sock};
+  my $packetsize = $self->{res}->udppacketsize;
+  $packetsize = 512  if $packetsize < 512;  # just in case
+  my $data = '';
+  my $peeraddr = $sock->recv($data, $packetsize+256);  # with some size margin for troubleshooting
+  defined $peeraddr or die "bgread: recv() failed: $!";
+  my $peerhost = $sock->peerhost;
+  $data ne '' or die "bgread: received empty packet from $peerhost";
+  dbg("dns: bgread: received %d bytes from %s", length($data), $peerhost);
+  my($answerpkt, $decoded_length) = Net::DNS::Packet->new(\$data);
+  $answerpkt or die "bgread: decoding DNS packet failed: $@";
+  $answerpkt->answerfrom($peerhost);
+  $decoded_length ||= 0;
+  if ($decoded_length != length($data)) {
+    warn sprintf("bgread: received a %d bytes packet from %s, decoded %d bytes\n",
+                 length($data), $peerhost, $decoded_length);
+  }
+  return $answerpkt;
 }
 
 ###########################################################################
@@ -767,13 +804,24 @@ sub poll_responses {
     $timeout = 0;  # next time around collect whatever is available, then exit
     last  if $nfound == 0;
 
-    my $packet = $self->{res}->bgread($self->{sock});
+    my $packet;
+    # Bug 7265, use our own bgread() below
+    # $packet = $self->{res}->bgread($self->{sock});
+    eval {
+      $packet = $self->bgread();  # Bug 7265, use our own bgread()
+    } or do {
+      undef $packet;
+      my $eval_stat = $@ ne '' ? $@ : "errno=$!";  chomp $eval_stat;
+      # resignal if alarm went off
+      die $eval_stat  if $eval_stat =~ /__alarm__ignore__\(.*\)/s;
+      info("dns: bad dns reply: %s", $eval_stat);
+    };
 
     if (!$packet) {
-      my $dns_err = $self->{res}->errorstring;
-      # resignal if alarm went off
-      die "dns (3) $dns_err\n"  if $dns_err =~ /__alarm__ignore__\(.*\)/s;
-      info("dns: bad dns reply: $dns_err");
+      # error already reported above
+#     my $dns_err = $self->{res}->errorstring;
+#     die "dns (3) $dns_err\n"  if $dns_err =~ /__alarm__ignore__\(.*\)/s;
+#     info("dns: bad dns reply: $dns_err");
     } else {
       my $header = $packet->header;
       if (!$header) {
@@ -809,8 +857,12 @@ sub poll_responses {
           $cb->($packet, $id, $now);
           $cnt++;
         } else {  # no match, report the problem
-          info("dns: no callback for id %s, ignored; packet: %s",
-               $id,  $packet ? $packet->string : "undef" );
+          if ($rcode eq 'REFUSED' || $id =~ m{^\d+/NO_QUESTION_IN_PACKET\z}) {
+            # the failure was already reported above
+          } else {
+            info("dns: no callback for id %s, ignored; packet: %s",
+                 $id,  $packet ? $packet->string : "undef" );
+          }
           # report a likely matching query for diagnostic purposes
           local $1;
           if ($id =~ m{^(\d+)/}) {
@@ -855,7 +907,8 @@ Emulates C<Net::DNS::Resolver::send()>.
 This subroutine is a simple synchronous leftover from SpamAssassin version
 3.3 and does not participate in packet query caching and callback grouping
 as implemented by AsyncLoop::bgsend_and_start_lookup().  As such it should
-be avoided for mainstream usage.
+be avoided for mainstream usage.  Currently used through Mail::SPF::Server
+by the SPF plugin.
 
 =cut
 
@@ -868,8 +921,9 @@ sub send {
   # using some arbitrary encoding (they are normally just 7-bit ascii
   # characters anyway, just need to get rid of the utf8 flag).  Bug 6959
   # Most if not all af these come from a SPF plugin.
+  #   (was a call to utf8::encode($name), now we prefer a proper idn_to_ascii)
   #
-  utf8::encode($name);
+  $name = idn_to_ascii($name);
 
   my $retrans = $self->{retrans};
   my $retries = $self->{retry};
