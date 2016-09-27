@@ -1,5 +1,5 @@
 # active ruleset list, automatically generated from http://ruleqa.spamassassin.org/
-# with results from: day 1: axb-coi-bulk axb-generic axb-ham-misc axb-ninja bpoliakoff darxus dwarren grenier jarif kgolding zmi; day 2: axb-coi-bulk axb-generic axb-ham-misc axb-ninja bb-kmcgrail bb-traps bb-zmi bpoliakoff darxus dwarren grenier jarif kgolding llanga zmi; day 3: axb-coi-bulk axb-generic axb-ham-misc axb-ninja bpoliakoff darxus dwarren grenier jarif kgolding llanga zmi
+# with results from: day 1: axb-coi-bulk axb-generic axb-ham-misc axb-ninja bpoliakoff darxus dwarren grenier jarif kgolding zmi; day 2: axb-coi-bulk axb-generic axb-ham-misc axb-ninja bb-traps bb-zmi bpoliakoff darxus dwarren grenier jarif kgolding llanga; day 3: axb-coi-bulk axb-generic axb-ham-misc axb-ninja bpoliakoff darxus dwarren grenier jarif kgolding llanga zmi
 
 # tflags publish
 AC_BR_BONANZA
@@ -43,9 +43,6 @@ ADMAIL
 # tflags publish
 ADVANCE_FEE_2_NEW_FORM
 
-# good enough
-ADVANCE_FEE_2_NEW_FRM_MNY
-
 # tflags publish
 ADVANCE_FEE_2_NEW_MONEY
 
@@ -55,6 +52,9 @@ ADVANCE_FEE_3_NEW
 # tflags publish
 ADVANCE_FEE_3_NEW_FORM
 
+# good enough
+ADVANCE_FEE_3_NEW_FRM_MNY
+
 # tflags publish
 ADVANCE_FEE_3_NEW_MONEY
 
@@ -62,13 +62,7 @@ ADVANCE_FEE_3_NEW_MONEY
 ADVANCE_FEE_4_NEW
 
 # good enough
-ADVANCE_FEE_4_NEW_FRM_MNY
-
-# good enough
 ADVANCE_FEE_4_NEW_MONEY
-
-# good enough
-ADVANCE_FEE_5_NEW
 
 # good enough
 ADVANCE_FEE_5_NEW_FRM_MNY
@@ -87,9 +81,6 @@ AXB_XMAILER_MIMEOLE_OL_024C2
 
 # good enough
 AXB_XMAILER_MIMEOLE_OL_1ECD5
-
-# good enough
-AXB_XM_FORGED_OL2600
 
 # tflags learn
 BAYES_00
@@ -120,9 +111,6 @@ BAYES_99
 
 # tflags learn
 BAYES_999
-
-# good enough
-BODY_EMPTY
 
 # good enough
 BODY_SINGLE_URI
@@ -212,9 +200,6 @@ DOS_ANAL_SPAM_MAILER
 DOS_OE_TO_MX
 
 # good enough
-DOS_OE_TO_MX_IMAGE
-
-# good enough
 DOS_OUTLOOK_TO_MX
 
 # tflags publish
@@ -240,9 +225,6 @@ FBI_SPOOF
 
 # tflags publish
 FILL_THIS_FORM
-
-# good enough
-FILL_THIS_FORM_FRAUD_PHISH
 
 # good enough
 FILL_THIS_FORM_LOAN
@@ -282,9 +264,6 @@ FROM_LOCAL_NOVOWEL
 
 # good enough
 FROM_MISSPACED
-
-# good enough
-FROM_MISSP_DYNIP
 
 # good enough
 FROM_MISSP_FREEMAIL
@@ -428,7 +407,7 @@ HK_NAME_DRUGS
 HK_NAME_MR_MRS
 
 # good enough
-HK_SCAM_N2
+HK_RANDOM_FROM
 
 # good enough
 HK_SCAM_S7
@@ -441,6 +420,9 @@ HTML_OFF_PAGE
 
 # good enough
 HTML_TAG_BALANCE_CENTER
+
+# good enough
+LIST_PARTIAL_SHORT_MSG
 
 # tflags publish
 LIST_PRTL_PUMPDUMP
@@ -806,7 +788,7 @@ RP_MATCHES_RCVD
 SERGIO_SUBJECT_VIAGRA01
 
 # good enough
-SHORTENED_URL_SRC
+SHARE_50_50
 
 # tflags publish
 SINGLETS_LOW_CONTRAST
@@ -923,22 +905,13 @@ TVD_SPACE_RATIO_MINFP
 TW_GIBBERISH_MANY
 
 # good enough
-ADVANCE_FEE_3_NEW_FRM_MNY
+BILLION_OVERLAP
 
 # good enough
-FREEMAIL_DOC_PDF_BCC
+OBFU_DOC_ATTACH
 
 # good enough
-HK_RANDOM_FROM
-
-# good enough
-HK_SCAM_N3
-
-# good enough
-LIST_PARTIAL_SHORT_MSG
-
-# good enough
-SHARE_50_50
+SPELLED_OUT_NUMBER
 
 # tflags publish
 UC_GIBBERISH_OBFU
